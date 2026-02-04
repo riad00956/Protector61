@@ -9,7 +9,7 @@ import time
 from telebot import types
 
 # ================= কনফিগারেশন =================
-TOKEN = "8000160699:AAGLMS-o6IxslVkZWgrJ1cLs6-6c02qrf6I"
+TOKEN = "8000160699:AAF76D47LQfkiw8CUgUqQRKoni2hG3vQ-OM"
 SUPER_ADMIN = 7832264582 
 bot = telebot.TeleBot(TOKEN)
 
