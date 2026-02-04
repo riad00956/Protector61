@@ -168,9 +168,8 @@ def handle_all(message):
             return
         if get_group_setting(cid, 'link_filter') == 1:
             if "http" in (message.text or "").lower() and not is_admin(uid, cid):
-                bot.delete_message(cid, message.message_id)
-                bot.send_message(cid, f"@{message.from_user.username} " হ্যাঁ ভাই🙂, উরাধুরা লিংক দাও, জায়গাটা কি তোমার বাপ কিনা রাখছে? 😒)
-
+             bot.send_message(cid,
+             f"@{message.from_user.username} হ্যাঁ ভাই🙂, উরাধুরা লিংক দাও, জায়গাটা কি তোমার বাপ কিনা রাখছে? 😒")
 @bot.callback_query_handler(func=lambda call: True)
 def callbacks(call):
     uid = call.from_user.id
