@@ -7,11 +7,31 @@ import json
 import threading
 import time
 from telebot import types
+from flask import Flask
+
+# ================= FLASK SERVER FOR RENDER =================
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is running perfectly!"
+
+def run_web_server():
+    # Render সাধারণত 10000 পোর্টে রান করে
+    app.run(host='0.0.0.0', port=10000)
 
 # ================= কনফিগারেশন =================
-TOKEN = "8000160699:AAF76D47LQfkiw8CUgUqQRKoni2hG3vQ-OM"
+# তোমার নতুন টোকেন এখানে আপডেট করে দিয়েছি
+TOKEN = "8000160699:AAHq1VLvd05PFxFVibuErFx4E6Uf7y6F8HE"
 SUPER_ADMIN = 7832264582 
 bot = telebot.TeleBot(TOKEN)
+
+# Conflict 409 এরর এড়াতে আগের সেশন ক্লিয়ার করা
+try:
+    bot.remove_webhook()
+    print("Old session cleared.")
+except:
+    pass
 
 # ================= DATABASE SYSTEM =================
 db_lock = threading.Lock()
@@ -140,7 +160,7 @@ def handle_all(message):
     if ("http" in text or "t.me" in text) and not is_admin(uid) and message.chat.type != "private":
         try:
             bot.delete_message(cid, message.message_id)
-            bot.send_message(cid, f"🚫 গ্রুপটা তো তোমার বাপের তাইনা?{message.from_user.first_name}, ডিলিট করো সমস্যা হবে 🐸💔🔥")
+            bot.send_message(cid, f"🚫 গ্রুপটা তো তোমার বাপের তাইনা? {message.from_user.first_name}, ডিলিট করো সমস্যা হবে 🐸💔🔥")
         except: pass
 
 # ================= CALLBACK LOGIC =================
@@ -227,7 +247,7 @@ def callback_logic(call):
         bot.register_next_step_handler(msg, start_bc, "all")
 
     elif call.data == "back_main":
-        bot.edit_message_text("🏮 Contact: @r_ifatbro22 |remove _ |- Admin Panel**", cid, mid, 
+        bot.edit_message_text("🏮 Contact: @r_ifatbro22 - Admin Panel", cid, mid, 
                              parse_mode="Markdown", reply_markup=main_admin_keyboard())
 
 # ================= হেল্পার ফাংশনস =================
@@ -267,11 +287,14 @@ def start_bc(message, target):
 
 # ================= RUN BOT =================
 if __name__ == "__main__":
-    print("Bot is starting...")
+    # ওয়েব সার্ভার চালু করা
+    threading.Thread(target=run_web_server, daemon=True).start()
+    
+    print("Bot is starting with new token...")
+    # Infinity polling এর জায়গায় polling ব্যবহার করা হয়েছে যাতে কনফ্লিক্ট সহজে হ্যান্ডেল করা যায়
     while True:
         try:
-            bot.infinity_polling(timeout=20, long_polling_timeout=10)
+            bot.polling(none_stop=True, interval=1, timeout=20)
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error occurred: {e}")
             time.sleep(5)
-      
