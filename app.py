@@ -7,6 +7,18 @@ import json
 import threading
 import time
 from telebot import types
+from flask import Flask
+
+# ================= FLASK SERVER FOR RENDER =================
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+def run_web_server():
+    # Render সাধারণত 10000 পোর্টে রান করে
+    app.run(host='0.0.0.0', port=10000)
 
 # ================= কনফিগারেশন =================
 TOKEN = "8000160699:AAGLMS-o6IxslVkZWgrJ1cLs6-6c02qrf6I"
@@ -140,7 +152,7 @@ def handle_all(message):
     if ("http" in text or "t.me" in text) and not is_admin(uid) and message.chat.type != "private":
         try:
             bot.delete_message(cid, message.message_id)
-            bot.send_message(cid, f"🚫 গ্রুপটা তো তোমার বাপের তাইনা?{message.from_user.first_name}, ডিলিট করো সমস্যা হবে 🐸💔🔥")
+            bot.send_message(cid, f"🚫 গ্রুপটা তো তোমার বাপের তাইনা? {message.from_user.first_name}, ডিলিট করো সমস্যা হবে 🐸💔🔥")
         except: pass
 
 # ================= CALLBACK LOGIC =================
@@ -227,7 +239,7 @@ def callback_logic(call):
         bot.register_next_step_handler(msg, start_bc, "all")
 
     elif call.data == "back_main":
-        bot.edit_message_text("🏮 Contact: @r_ifatbro22 |remove _ |- Admin Panel**", cid, mid, 
+        bot.edit_message_text("🏮 Contact: @r_ifatbro22 - Admin Panel", cid, mid, 
                              parse_mode="Markdown", reply_markup=main_admin_keyboard())
 
 # ================= হেল্পার ফাংশনস =================
@@ -267,6 +279,9 @@ def start_bc(message, target):
 
 # ================= RUN BOT =================
 if __name__ == "__main__":
+    # ওয়েব সার্ভার ব্যাকগ্রাউন্ড থ্রেডে স্টার্ট করা
+    threading.Thread(target=run_web_server, daemon=True).start()
+    
     print("Bot is starting...")
     while True:
         try:
@@ -274,4 +289,4 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Error: {e}")
             time.sleep(5)
-      
+        
