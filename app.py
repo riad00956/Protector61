@@ -1,9 +1,6 @@
 import telebot
 import sqlite3
-import io
 import datetime
-import requests
-import json
 import threading
 import time
 from telebot import types
@@ -21,11 +18,11 @@ def run_web_server():
 
 # ================= CONFIGURATION =================
 TOKEN = "8000160699:AAHq1VLvd05PFxFVibuErFx4E6Uf7y6F8HE"
-SUPER_ADMIN = 7832264582 
+SUPER_ADMIN = 7832264582
 bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=25)
 
-active_sessions = {} # {user_id: admin_id}
-cooldowns = {} # {user_id: timestamp}
+active_sessions = {}  # {user_id: admin_id}
+cooldowns = {}        # {user_id: timestamp}
 
 try:
     bot.remove_webhook()
@@ -42,21 +39,21 @@ def init_db():
     with db_lock:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('''CREATE TABLE IF NOT EXISTS admins 
-                          (user_id INTEGER PRIMARY KEY, target_group INTEGER, perms TEXT)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS admins
+            (user_id INTEGER PRIMARY KEY, target_group INTEGER, perms TEXT)''')
         cursor.execute('CREATE TABLE IF NOT EXISTS groups (chat_id INTEGER PRIMARY KEY, title TEXT)')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS settings 
-                          (chat_id INTEGER PRIMARY KEY, maintenance INTEGER DEFAULT 0, 
-                           link_filter INTEGER DEFAULT 1, bot_status INTEGER DEFAULT 1)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS settings
+            (chat_id INTEGER PRIMARY KEY, maintenance INTEGER DEFAULT 0,
+            link_filter INTEGER DEFAULT 1, bot_status INTEGER DEFAULT 1)''')
         cursor.execute('CREATE TABLE IF NOT EXISTS logs (date TEXT PRIMARY KEY, count INTEGER DEFAULT 0)')
-        cursor.execute('''CREATE TABLE IF NOT EXISTS users 
-                          (user_id INTEGER PRIMARY KEY, username TEXT, last_msg TEXT, is_banned INTEGER DEFAULT 0)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS users
+            (user_id INTEGER PRIMARY KEY, username TEXT, last_msg TEXT, is_banned INTEGER DEFAULT 0)''')
         conn.commit()
         conn.close()
 
 init_db()
 
-# --- Helpers ---
+# ================= HELPERS =================
 def get_setting(chat_id, key):
     with db_lock:
         conn = get_db_connection()
@@ -96,12 +93,12 @@ def is_admin(user_id, chat_id=None):
         cursor.execute('SELECT target_group FROM admins WHERE user_id = ?', (user_id,))
         res = cursor.fetchone()
         conn.close()
-        if res:
-            if chat_id and int(res[0]) != int(chat_id): return False
-            return True
-        return False
+    if res:
+        if chat_id and int(res[0]) != int(chat_id): return False
+        return True
+    return False
 
-# ================= KEYBOARDS (ENGLISH) =================
+# ================= KEYBOARDS =================
 def main_admin_keyboard(uid):
     markup = types.InlineKeyboardMarkup(row_width=2)
     if uid == SUPER_ADMIN:
@@ -127,7 +124,7 @@ def group_control_keyboard(chat_id):
     m = get_setting(chat_id, 'maintenance')
     l = get_setting(chat_id, 'link_filter')
     s = get_setting(chat_id, 'bot_status')
-    
+
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton(f"{'🔴' if m else '🟢'} Maintenance: {'ON' if m else 'OFF'}", callback_data=f"tog_m_{chat_id}"),
@@ -144,7 +141,7 @@ def user_request_keyboard():
     markup.add(types.InlineKeyboardButton("🙋 Request to Chat", callback_data="req_chat"))
     return markup
 
-# ================= HANDLERS =================
+# ================= MESSAGE HANDLER =================
 @bot.message_handler(func=lambda m: True, content_types=['text', 'photo', 'video', 'document'])
 def handle_all(message):
     uid = message.from_user.id
@@ -164,9 +161,9 @@ def handle_all(message):
 
         if message.text == "/admin":
             if is_admin(uid):
-                bot.send_message(cid, "🏮 **Admin Control Panel**", reply_markup=main_admin_keyboard(uid), parse_mode="Markdown")
+                bot.send_message(cid, "🏮 Admin Control Panel", reply_markup=main_admin_keyboard(uid), parse_mode="Markdown")
             return
-        
+
         if not is_admin(uid):
             username = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
             with db_lock:
@@ -174,16 +171,16 @@ def handle_all(message):
                 cursor = conn.cursor()
                 cursor.execute('SELECT user_id FROM users WHERE user_id = ?', (uid,))
                 exists = cursor.fetchone()
-                cursor.execute('INSERT OR REPLACE INTO users (user_id, username, last_msg) VALUES (?, ?, ?)', 
+                cursor.execute('INSERT OR REPLACE INTO users (user_id, username, last_msg) VALUES (?, ?, ?)',
                                (uid, username, message.text if message.text else "[Media]"))
                 conn.commit()
                 conn.close()
-            
-            if message.text == "/start":
-                bot.send_message(cid, f"Hello {message.from_user.first_name}! Welcome.", reply_markup=user_request_keyboard())
-                if not exists:
-                    bot.send_message(SUPER_ADMIN, f"🆕 **New User Alert!**\nName: {message.from_user.first_name}\nID: `{uid}`", parse_mode="Markdown")
-            else:
+
+            if message.text == "/start":        
+                bot.send_message(cid, f"Hello {message.from_user.first_name}! Welcome.", reply_markup=user_request_keyboard())        
+                if not exists:        
+                    bot.send_message(SUPER_ADMIN, f"🆕 **New User Alert!**\nName: {message.from_user.first_name}\nID: `{uid}`", parse_mode="Markdown")        
+            else:        
                 bot.send_message(cid, "⚠️ You don't have an active session.", reply_markup=user_request_keyboard())
 
     if message.chat.type != "private":
@@ -203,6 +200,7 @@ def handle_all(message):
                     bot.send_message(cid, f"{message.from_user.first_name} হ্যাঁ, লিংক দাও😐। তোমার বাপের জায়গা আরো বেশি বেশি লিংক দাও 😒")
                 except: pass
 
+# ================= CALLBACK HANDLER =================
 @bot.callback_query_handler(func=lambda call: True)
 def callback_logic(call):
     uid = call.from_user.id
@@ -218,12 +216,12 @@ def callback_logic(call):
         bot.edit_message_text("✅ Request sent.", cid, mid)
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("✅ Start Session", callback_data=f"start_sess_{uid}"))
-        bot.send_message(SUPER_ADMIN, f"🙋 **Chat Request!**\nName: {call.from_user.first_name}\nID: `{uid}`", reply_markup=markup, parse_mode="Markdown")
+        bot.send_message(SUPER_ADMIN, f"🙋 Chat Request!\nName: {call.from_user.first_name}\nID: {uid}", reply_markup=markup, parse_mode="Markdown")
         return
 
     if not is_admin(uid): return
 
-    # --- Group & Admin Management Logic ---
+    # --- Group & Admin Management ---
     if call.data == "list_groups":
         with db_lock:
             conn = get_db_connection()
@@ -232,11 +230,11 @@ def callback_logic(call):
         markup = types.InlineKeyboardMarkup()
         for row in rows: markup.add(types.InlineKeyboardButton(f"📍 {row[1]}", callback_data=f"mng_{row[0]}"))
         markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
-        bot.edit_message_text("📂 **Manage Groups:**", cid, mid, reply_markup=markup)
+        bot.edit_message_text("📂 Manage Groups:", cid, mid, reply_markup=markup)
 
     elif call.data.startswith("mng_"):
         target_id = int(call.data.split("_")[1])
-        bot.edit_message_text(f"⚙️ **Control:** `{target_id}`", cid, mid, reply_markup=group_control_keyboard(target_id))
+        bot.edit_message_text(f"⚙️ Control: {target_id}", cid, mid, reply_markup=group_control_keyboard(target_id))
 
     elif call.data.startswith("tog_"):
         _, key_code, target_id = call.data.split("_")
@@ -245,7 +243,7 @@ def callback_logic(call):
         bot.edit_message_reply_markup(cid, mid, reply_markup=group_control_keyboard(int(target_id)))
 
     elif call.data.startswith("bc_"):
-        target_id = call.data.split("_")[1]
+        target_id = int(call.data.split("_")[1])
         msg = bot.send_message(cid, "✍️ Send the message you want to broadcast to this group:")
         bot.register_next_step_handler(msg, process_group_broadcast, target_id)
 
@@ -262,8 +260,8 @@ def callback_logic(call):
             conn = get_db_connection()
             admins = conn.cursor().execute('SELECT user_id FROM admins').fetchall()
             conn.close()
-        text = f"👑 **Super:** `{SUPER_ADMIN}`\n\n"
-        for a in admins: text += f"👤 **Admin:** `{a[0]}`\n"
+        text = f"👑 Super: {SUPER_ADMIN}\n\n"
+        for a in admins: text += f"👤 Admin: {a[0]}\n"
         bot.send_message(cid, text, parse_mode="Markdown")
 
     elif call.data == "del_admin_list":
@@ -274,7 +272,7 @@ def callback_logic(call):
         markup = types.InlineKeyboardMarkup()
         for a in admins: markup.add(types.InlineKeyboardButton(f"❌ {a[0]}", callback_data=f"rm_adm_{a[0]}"))
         markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
-        bot.edit_message_text("➖ **Select Admin to Remove:**", cid, mid, reply_markup=markup)
+        bot.edit_message_text("➖ Select Admin to Remove:", cid, mid, reply_markup=markup)
 
     elif call.data.startswith("rm_adm_"):
         adm_id = int(call.data.split("_")[2])
@@ -304,14 +302,15 @@ def callback_logic(call):
         bot.send_message(target_uid, "⚠️ Session Expired.", reply_markup=user_request_keyboard())
 
     elif call.data == "back_main":
-        bot.edit_message_text("🏮 **Admin Control Panel**", cid, mid, reply_markup=main_admin_keyboard(uid), parse_mode="Markdown")
+        bot.edit_message_text("🏮 Admin Control Panel", cid, mid, reply_markup=main_admin_keyboard(uid), parse_mode="Markdown")
 
-# ================= HELPERS (Missing Logic Restored) =================
+# ================= BROADCAST & ADMIN HELPERS =================
 def process_group_broadcast(message, target_id):
     try:
-        bot.send_message(target_id, f"📢 **Announcement:**\n\n{message.text}", parse_mode="Markdown")
-        bot.send_message(message.chat.id, "✅ Broadcast Sent Successfully!")
-    except: bot.send_message(message.chat.id, "❌ Failed to send broadcast.")
+        bot.send_message(target_id, f"\n\n{message.text}", parse_mode="Markdown")
+        bot.send_message(message.chat.id, "✅ Sent Successfully!")
+    except:
+        bot.send_message(message.chat.id, "❌ Failed.")
 
 def process_global_broadcast(message):
     with db_lock:
@@ -321,9 +320,10 @@ def process_global_broadcast(message):
     count = 0
     for g in groups:
         try:
-            bot.send_message(g[0], f"📢 **Global Announcement:**\n\n{message.text}", parse_mode="Markdown")
+            bot.send_message(g[0], f"📢 Global Announcement:\n\n{message.text}", parse_mode="Markdown")
             count += 1
-        except: continue
+        except:
+            continue
     bot.send_message(message.chat.id, f"✅ Broadcast sent to {count} groups.")
 
 def process_add_admin(message):
@@ -334,14 +334,15 @@ def process_add_admin(message):
             conn.cursor().execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (new_id,))
             conn.commit()
             conn.close()
-        bot.send_message(message.chat.id, f"✅ Admin added: `{new_id}`")
-    except: bot.send_message(message.chat.id, "❌ Invalid ID!")
+        bot.send_message(message.chat.id, f"✅ Admin added: {new_id}")
+    except:
+        bot.send_message(message.chat.id, "❌ Invalid ID!")
 
-# ================= RUN =================
+# ================= RUN BOT =================
 if __name__ == "__main__":
     threading.Thread(target=run_web_server, daemon=True).start()
     while True:
         try:
             bot.polling(none_stop=True, interval=0, timeout=30)
-        except: time.sleep(5)
-        
+        except:
+            time.sleep(5)
