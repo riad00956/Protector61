@@ -69,7 +69,7 @@ def toggle_setting(chat_id, key):
     with db_lock:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute(f'INSERT OR IGNORE INTO settings (chat_id) VALUES (?)', (chat_id,))
+        cursor.execute('INSERT OR IGNORE INTO settings (chat_id) VALUES (?)', (chat_id,))
         cursor.execute(f'UPDATE settings SET {key} = ? WHERE chat_id = ?', (new_val, chat_id))
         conn.commit()
         conn.close()
@@ -136,6 +136,17 @@ def group_control_keyboard(chat_id):
     )
     return markup
 
+def inbox_user_keyboard():
+    with db_lock:
+        conn = get_db_connection()
+        users = conn.cursor().execute('SELECT user_id, username FROM users').fetchall()
+        conn.close()
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for u in users:
+        markup.add(types.InlineKeyboardButton(f"{u[1]}", callback_data=f"inbox_user_{u[0]}"))
+    markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+    return markup
+
 def user_request_keyboard():
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("🙋 Request to Chat", callback_data="req_chat"))
@@ -148,6 +159,7 @@ def handle_all(message):
     cid = message.chat.id
     log_message()
 
+    # --- PRIVATE CHATS ---
     if message.chat.type == "private":
         if uid in active_sessions:
             target_id = active_sessions[uid]
@@ -176,13 +188,14 @@ def handle_all(message):
                 conn.commit()
                 conn.close()
 
-            if message.text == "/start":        
-                bot.send_message(cid, f"Hello {message.from_user.first_name}! Welcome.", reply_markup=user_request_keyboard())        
-                if not exists:        
-                    bot.send_message(SUPER_ADMIN, f"🆕 **New User Alert!**\nName: {message.from_user.first_name}\nID: `{uid}`", parse_mode="Markdown")        
-            else:        
+            if message.text == "/start":
+                bot.send_message(cid, f"Hello {message.from_user.first_name}! Welcome.", reply_markup=user_request_keyboard())
+                if not exists:
+                    bot.send_message(SUPER_ADMIN, f"🆕 **New User Alert!**\nName: {message.from_user.first_name}\nID: `{uid}`", parse_mode="Markdown")
+            else:
                 bot.send_message(cid, "⚠️ You don't have an active session.", reply_markup=user_request_keyboard())
 
+    # --- GROUP CHATS ---
     if message.chat.type != "private":
         with db_lock:
             conn = get_db_connection()
@@ -197,7 +210,7 @@ def handle_all(message):
             if ("http" in text or "t.me" in text) and not is_admin(uid):
                 try:
                     bot.delete_message(cid, message.message_id)
-                    bot.send_message(cid, f"{message.from_user.first_name} হ্যাঁ, লিংক দাও😐। তোমার বাপের জায়গা আরো বেশি বেশি লিংক দাও 😒")
+                    bot.send_message(cid, f"{message.from_user.first_name}, লিংক দেওয়া নিষিদ্ধ 😒")
                 except: pass
 
 # ================= CALLBACK HANDLER =================
@@ -207,6 +220,7 @@ def callback_logic(call):
     cid = call.message.chat.id
     mid = call.message.message_id
 
+    # --- USER REQUEST ---
     if call.data == "req_chat":
         now = time.time()
         if uid in cooldowns and now - cooldowns[uid] < 600:
@@ -219,16 +233,18 @@ def callback_logic(call):
         bot.send_message(SUPER_ADMIN, f"🙋 Chat Request!\nName: {call.from_user.first_name}\nID: {uid}", reply_markup=markup, parse_mode="Markdown")
         return
 
+    # --- ADMIN ONLY ---
     if not is_admin(uid): return
 
-    # --- Group & Admin Management ---
+    # --- Group Management ---
     if call.data == "list_groups":
         with db_lock:
             conn = get_db_connection()
             rows = conn.cursor().execute('SELECT chat_id, title FROM groups').fetchall()
             conn.close()
         markup = types.InlineKeyboardMarkup()
-        for row in rows: markup.add(types.InlineKeyboardButton(f"📍 {row[1]}", callback_data=f"mng_{row[0]}"))
+        for row in rows:
+            markup.add(types.InlineKeyboardButton(f"📍 {row[1]}", callback_data=f"mng_{row[0]}"))
         markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
         bot.edit_message_text("📂 Manage Groups:", cid, mid, reply_markup=markup)
 
@@ -242,47 +258,42 @@ def callback_logic(call):
         toggle_setting(int(target_id), key_map[key_code])
         bot.edit_message_reply_markup(cid, mid, reply_markup=group_control_keyboard(int(target_id)))
 
+    elif call.data.startswith("leave_"):
+        target_id = int(call.data.split("_")[1])
+        try:
+            bot.leave_chat(target_id)
+        except:
+            pass
+        bot.edit_message_text("🚪 Bot left the group successfully.", cid, mid)
+
+    # --- Broadcasts ---
     elif call.data.startswith("bc_"):
         target_id = int(call.data.split("_")[1])
         msg = bot.send_message(cid, "✍️ Send the message you want to broadcast to this group:")
         bot.register_next_step_handler(msg, process_group_broadcast, target_id)
-
     elif call.data == "bc_all":
         msg = bot.send_message(cid, "✍️ Send the message for Global Broadcast:")
         bot.register_next_step_handler(msg, process_global_broadcast)
 
-    elif call.data == "add_admin":
-        msg = bot.send_message(cid, "🆔 Send User ID for new Admin:")
-        bot.register_next_step_handler(msg, process_add_admin)
-
-    elif call.data == "admin_list":
-        with db_lock:
-            conn = get_db_connection()
-            admins = conn.cursor().execute('SELECT user_id FROM admins').fetchall()
-            conn.close()
-        text = f"👑 Super: {SUPER_ADMIN}\n\n"
-        for a in admins: text += f"👤 Admin: {a[0]}\n"
-        bot.send_message(cid, text, parse_mode="Markdown")
-
-    elif call.data == "del_admin_list":
-        with db_lock:
-            conn = get_db_connection()
-            admins = conn.cursor().execute('SELECT user_id FROM admins').fetchall()
-            conn.close()
+    # --- Inbox Messages ---
+    elif call.data == "inbox_list":
+        bot.edit_message_text("📥 Users Inbox:", cid, mid, reply_markup=inbox_user_keyboard())
+    elif call.data.startswith("inbox_user_"):
+        user_id = int(call.data.split("_")[2])
         markup = types.InlineKeyboardMarkup()
-        for a in admins: markup.add(types.InlineKeyboardButton(f"❌ {a[0]}", callback_data=f"rm_adm_{a[0]}"))
-        markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
-        bot.edit_message_text("➖ Select Admin to Remove:", cid, mid, reply_markup=markup)
+        markup.add(types.InlineKeyboardButton("🛑 End Session", callback_data=f"end_sess_{user_id}"))
+        markup.add(types.InlineKeyboardButton("🚫 Ban User", callback_data=f"ban_user_{user_id}"))
+        markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data="inbox_list"))
+        bot.edit_message_text(f"User ID: {user_id}", cid, mid, reply_markup=markup)
 
-    elif call.data.startswith("rm_adm_"):
-        adm_id = int(call.data.split("_")[2])
+    elif call.data.startswith("ban_user_"):
+        user_id = int(call.data.split("_")[2])
         with db_lock:
             conn = get_db_connection()
-            conn.cursor().execute('DELETE FROM admins WHERE user_id = ?', (adm_id,))
+            conn.cursor().execute('UPDATE users SET is_banned=1 WHERE user_id=?', (user_id,))
             conn.commit()
             conn.close()
-        bot.answer_callback_query(call.id, "Admin Removed!")
-        bot.edit_message_text("✅ Admin Removed Successfully.", cid, mid, reply_markup=main_admin_keyboard(uid))
+        bot.edit_message_text(f"🚫 User {user_id} banned successfully.", cid, mid)
 
     # --- Session Control ---
     elif call.data.startswith("start_sess_"):
@@ -304,7 +315,7 @@ def callback_logic(call):
     elif call.data == "back_main":
         bot.edit_message_text("🏮 Admin Control Panel", cid, mid, reply_markup=main_admin_keyboard(uid), parse_mode="Markdown")
 
-# ================= BROADCAST & ADMIN HELPERS =================
+# ================= BROADCAST HELPERS =================
 def process_group_broadcast(message, target_id):
     try:
         bot.send_message(target_id, f"\n\n{message.text}", parse_mode="Markdown")
