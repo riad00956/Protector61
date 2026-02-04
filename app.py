@@ -44,7 +44,6 @@ def init_db():
                            link_filter INTEGER DEFAULT 1, bot_status INTEGER DEFAULT 1)''')
         cursor.execute('''CREATE TABLE IF NOT EXISTS users 
                           (user_id INTEGER PRIMARY KEY, username TEXT, is_banned INTEGER DEFAULT 0)''')
-        # লিভ মেসেজ ডিফল্ট সেট করা
         cursor.execute('INSERT OR IGNORE INTO settings (id, leave_msg) VALUES (1, "আমি বের হয়ে যাচ্ছি, ভালো থেকো।")')
         conn.commit()
         conn.close()
@@ -71,7 +70,9 @@ def get_group_setting(chat_id, key):
         conn = get_db_connection()
         res = conn.execute(f'SELECT {key} FROM group_settings WHERE chat_id = ?', (chat_id,)).fetchone()
         conn.close()
-        if res is None: return 1 if key != 'maintenance' else 0
+        if res is None: 
+            # Default settings if group not in DB
+            return 1 if key != 'maintenance' else 0
         return res[0]
 
 def is_admin(user_id, chat_id=None):
@@ -133,10 +134,11 @@ def commands(message):
         if is_banned(uid):
             bot.send_message(uid, "❌ You are banned from using this bot.")
             return
-        # Register User
+        
         with db_lock:
             conn = get_db_connection()
-            conn.execute('INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)', (uid, f"@{message.from_user.username}" or message.from_user.first_name))
+            name = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
+            conn.execute('INSERT OR REPLACE INTO users (user_id, username) VALUES (?, ?)', (uid, name))
             conn.commit()
             conn.close()
         
@@ -156,20 +158,36 @@ def handle_all(message):
             try:
                 if message.text: bot.send_message(target, message.text)
                 elif message.photo: bot.send_photo(target, message.photo[-1].file_id, caption=message.caption)
-                # ... other media ...
+                elif message.video: bot.send_video(target, message.video.file_id, caption=message.caption)
+                elif message.document: bot.send_document(target, message.document.file_id, caption=message.caption)
             except: bot.send_message(uid, "⚠️ Connection lost.")
         elif not is_admin(uid):
             bot.send_message(uid, "👋 Please request a chat first.")
     else:
+        # Group Registration
+        with db_lock:
+            conn = get_db_connection()
+            conn.execute('INSERT OR REPLACE INTO groups VALUES (?, ?)', (cid, message.chat.title))
+            conn.commit()
+            conn.close()
+
         # Group Settings & Filters
         if get_group_setting(cid, 'bot_status') == 0: return
+        
         if get_group_setting(cid, 'maintenance') == 1 and not is_admin(uid, cid):
-            bot.delete_message(cid, message.message_id)
+            try: bot.delete_message(cid, message.message_id)
+            except: pass
             return
+
         if get_group_setting(cid, 'link_filter') == 1:
-            if "http" in (message.text or "").lower() and not is_admin(uid, cid):
-             bot.send_message(cid,
-             f"@{message.from_user.username} হ্যাঁ ভাই🙂, উরাধুরা লিংক দাও, জায়গাটা কি তোমার বাপ কিনা রাখছে? 😒")
+            text = (message.text or message.caption or "").lower()
+            if ("http" in text or "t.me" in text) and not is_admin(uid, cid):
+                try:
+                    bot.delete_message(cid, message.message_id)
+                    user_ref = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
+                    bot.send_message(cid, f"{user_ref} ভাই, গ্রুপটা আপনার বাপ-দাদার সম্পত্তি। আপনার ইচ্ছামত লিংক দেন 😒")
+                except: pass
+
 @bot.callback_query_handler(func=lambda call: True)
 def callbacks(call):
     uid = call.from_user.id
@@ -204,7 +222,7 @@ def callbacks(call):
         if not is_admin(uid): return
         with db_lock:
             conn = get_db_connection()
-            users = conn.execute('SELECT user_id, username FROM users LIMIT 20').fetchall()
+            users = conn.execute('SELECT user_id, username FROM users LIMIT 25').fetchall()
             conn.close()
         markup = types.InlineKeyboardMarkup()
         for u in users:
@@ -227,6 +245,13 @@ def callbacks(call):
         bot.answer_callback_query(call.id, f"User {'Banned' if new_status else 'Unbanned'}")
         bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=user_manage_keyboard(target))
 
+    elif data.startswith("start_sess_"):
+        target = int(data.split("_")[2])
+        active_sessions[uid] = target
+        active_sessions[target] = uid
+        bot.send_message(uid, f"✅ Chat session started with `{target}`. Send messages now.", parse_mode="Markdown")
+        bot.send_message(target, "✅ An admin has started a chat session with you.")
+
     elif data == "set_leave_msg":
         msg = bot.send_message(uid, "✍️ Send the new leave message:")
         bot.register_next_step_handler(msg, save_leave_msg)
@@ -242,7 +267,23 @@ def callbacks(call):
         bot.edit_message_text("📂 **Groups:**", call.message.chat.id, call.message.message_id, reply_markup=markup)
 
     elif data.startswith("ctrl_"):
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=group_control_keyboard(int(data.split("_")[1])))
+        target_cid = int(data.split("_")[1])
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=group_control_keyboard(target_cid))
+
+    elif data.startswith("tog_"):
+        # Format: tog_m_chatid
+        parts = data.split("_")
+        key = {'m': 'maintenance', 'l': 'link_filter', 's': 'bot_status'}[parts[1]]
+        t_cid = int(parts[2])
+        current = get_group_setting(t_cid, key)
+        new_val = 0 if current == 1 else 1
+        with db_lock:
+            conn = get_db_connection()
+            conn.execute('INSERT OR IGNORE INTO group_settings (chat_id) VALUES (?)', (t_cid,))
+            conn.execute(f'UPDATE group_settings SET {key} = ? WHERE chat_id = ?', (new_val, t_cid))
+            conn.commit()
+            conn.close()
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=group_control_keyboard(t_cid))
 
     elif data.startswith("leave_"):
         cid = int(data.split("_")[1])
@@ -250,19 +291,26 @@ def callbacks(call):
         try:
             bot.send_message(cid, leave_text)
             bot.leave_chat(cid)
-            bot.answer_callback_query(call.id, "Left Group!")
+            bot.edit_message_text(f"✅ Left group: `{cid}`", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
         except: bot.answer_callback_query(call.id, "Error leaving.")
 
+    elif data == "back_main":
+        bot.edit_message_text("🏮 **Admin Control Panel**", call.message.chat.id, call.message.message_id, reply_markup=main_admin_keyboard(uid), parse_mode="Markdown")
+
 def save_leave_msg(message):
-    with db_lock:
-        conn = get_db_connection()
-        conn.execute('UPDATE settings SET leave_msg = ? WHERE id = 1', (message.text,))
-        conn.commit()
-        conn.close()
-    bot.send_message(message.chat.id, f"✅ Leave message updated to:\n`{message.text}`")
+    if message.text:
+        with db_lock:
+            conn = get_db_connection()
+            conn.execute('UPDATE settings SET leave_msg = ? WHERE id = 1', (message.text,))
+            conn.commit()
+            conn.close()
+        bot.send_message(message.chat.id, f"✅ Leave message updated to:\n`{message.text}`")
+    else:
+        bot.send_message(message.chat.id, "❌ Please send a text message.")
 
 # ================= RUN =================
 if __name__ == "__main__":
     threading.Thread(target=run_web_server, daemon=True).start()
     init_db()
     bot.polling(none_stop=True)
+    
