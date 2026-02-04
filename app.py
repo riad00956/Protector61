@@ -3,6 +3,7 @@ import sqlite3
 import datetime
 import threading
 import time
+import os
 from telebot import types
 from flask import Flask
 
@@ -11,19 +12,24 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    return "Bot is running perfectly!"
+    return "🤖 Bot is running perfectly! 🚀"
 
 def run_web_server():
     app.run(host='0.0.0.0', port=10000)
 
 # ================= CONFIGURATION =================
-TOKEN = "8000160699:AAHq1VLvd05PFxFVibuErFx4E6Uf7y6F8HE"
-SUPER_ADMIN = 7832264582 
+TOKEN = "8000160699:AAHq1VLvd05PFxFVibuErFx4E6Uf7y6F8HE"  # BotFather থেকে টোকেন দিন
+SUPER_ADMIN = 7832264582 # আপনার টেলিগ্রাম আইডি
 bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=25)
 
-active_sessions = {}  # {admin_id: user_id}
-chat_requests = {}  # {user_id: {"time": timestamp, "status": "pending"}}
-cooldowns = {}  # {user_id: timestamp}
+# ================= GLOBAL VARIABLES =================
+active_sessions = {}  # {admin_id: user_id, user_id: admin_id}
+chat_requests = {}    # {user_id: {"time": timestamp, "status": "pending"}}
+cooldowns = {}        # {user_id: timestamp}
+broadcast_messages = {}  # {admin_id: {"text": "", "groups": []}}
+user_stats = {}       # {user_id: {"messages_sent": 0, "last_active": ""}}
+group_settings = {}   # {chat_id: {"link_filter": True, "maintenance": False}}
+db_lock = threading.Lock()
 
 try:
     bot.remove_webhook()
@@ -31,530 +37,1183 @@ except:
     pass
 
 # ================= DATABASE SYSTEM =================
-db_lock = threading.Lock()
-
 def get_db_connection():
-    return sqlite3.connect('bot_final.db', check_same_thread=False)
+    return sqlite3.connect('bot_database.db', check_same_thread=False)
 
 def init_db():
     with db_lock:
         conn = get_db_connection()
         cursor = conn.cursor()
-        # Admins table
-        cursor.execute('''CREATE TABLE IF NOT EXISTS admins 
-                          (user_id INTEGER PRIMARY KEY, target_group INTEGER DEFAULT 0, perms TEXT)''')
-        # Groups table
-        cursor.execute('''CREATE TABLE IF NOT EXISTS groups 
-                          (chat_id INTEGER PRIMARY KEY, title TEXT, 
-                           maintenance INTEGER DEFAULT 0, link_filter INTEGER DEFAULT 1, 
-                           bot_status INTEGER DEFAULT 1, leave_msg TEXT DEFAULT "আমি বের হয়ে যাচ্ছি, ভালো থেকো।")''')
-        # Users table
-        cursor.execute('''CREATE TABLE IF NOT EXISTS users 
-                          (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, 
-                           last_seen TEXT, is_banned INTEGER DEFAULT 0, 
-                           chat_requests INTEGER DEFAULT 0)''')
-        # Messages table for user messages
-        cursor.execute('''CREATE TABLE IF NOT EXISTS user_messages 
-                          (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, 
-                           message_text TEXT, message_type TEXT, 
-                           timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+        
+        # Users Table
+        cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            join_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+            is_banned INTEGER DEFAULT 0,
+            total_messages INTEGER DEFAULT 0,
+            chat_requests INTEGER DEFAULT 0,
+            warning_count INTEGER DEFAULT 0
+        )''')
+        
+        # Groups Table
+        cursor.execute('''CREATE TABLE IF NOT EXISTS groups (
+            chat_id INTEGER PRIMARY KEY,
+            title TEXT,
+            added_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+            total_messages INTEGER DEFAULT 0,
+            is_active INTEGER DEFAULT 1,
+            welcome_message TEXT DEFAULT "Welcome to the group! 👋",
+            rules TEXT DEFAULT "Follow the rules and be respectful.",
+            link_filter INTEGER DEFAULT 1,
+            maintenance_mode INTEGER DEFAULT 0,
+            bot_status INTEGER DEFAULT 1,
+            leave_message TEXT DEFAULT "Goodbye! 👋"
+        )''')
+        
+        # Admins Table
+        cursor.execute('''CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            added_by INTEGER,
+            added_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+            permissions TEXT DEFAULT "view",
+            target_group INTEGER DEFAULT 0,
+            is_super INTEGER DEFAULT 0
+        )''')
+        
+        # Messages Table
+        cursor.execute('''CREATE TABLE IF NOT EXISTS messages (
+            message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            chat_id INTEGER,
+            message_text TEXT,
+            message_type TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            forwarded_to INTEGER DEFAULT 0
+        )''')
+        
+        # Broadcast History
+        cursor.execute('''CREATE TABLE IF NOT EXISTS broadcasts (
+            broadcast_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER,
+            message_text TEXT,
+            total_groups INTEGER,
+            success_count INTEGER,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )''')
+        
+        # Session History
+        cursor.execute('''CREATE TABLE IF NOT EXISTS sessions (
+            session_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER,
+            user_id INTEGER,
+            start_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+            end_time DATETIME,
+            total_messages INTEGER DEFAULT 0
+        )''')
+        
         conn.commit()
         conn.close()
 
 init_db()
 
 # ================= HELPER FUNCTIONS =================
-def get_setting(chat_id, key):
+def log_activity(user_id, activity_type, details=""):
+    """লগ সংরক্ষণ"""
     with db_lock:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute(f'SELECT {key} FROM groups WHERE chat_id = ?', (chat_id,))
-        res = cursor.fetchone()
-        conn.close()
-        if res is None:
-            if key == 'leave_msg': 
-                return "আমি বের হয়ে যাচ্ছি, ভালো থেকো।"
-            elif key == 'bot_status':
-                return 1
-            else:
-                return 0
-        return res[0]
-
-def update_setting(chat_id, key, value):
-    with db_lock:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('INSERT OR IGNORE INTO groups (chat_id, title) VALUES (?, ?)', (chat_id, "Group"))
-        cursor.execute(f'UPDATE groups SET {key} = ? WHERE chat_id = ?', (value, chat_id))
+        cursor.execute('''INSERT INTO activity_logs 
+                        (user_id, activity_type, details, timestamp) 
+                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)''',
+                     (user_id, activity_type, details))
         conn.commit()
         conn.close()
 
-def toggle_setting(chat_id, key):
-    current = get_setting(chat_id, key)
-    new_val = 1 if current == 0 else 0
-    update_setting(chat_id, key, new_val)
-    return new_val
-
-def register_user(user_id, username, first_name):
+def register_user(user_id, username, first_name, last_name=""):
+    """ব্যবহারকারী নিবন্ধন"""
     with db_lock:
         conn = get_db_connection()
         cursor = conn.cursor()
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cursor.execute('''INSERT OR REPLACE INTO users 
-                          (user_id, username, first_name, last_seen) 
-                          VALUES (?, ?, ?, ?)''', 
-                       (user_id, username, first_name, now))
+        cursor.execute('''INSERT OR IGNORE INTO users 
+                        (user_id, username, first_name, last_name, join_date, last_seen) 
+                        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)''',
+                     (user_id, username, first_name, last_name))
         conn.commit()
         conn.close()
 
 def update_user_last_seen(user_id):
+    """ব্যবহারকারীর সর্বশেষ দেখা আপডেট"""
     with db_lock:
         conn = get_db_connection()
         cursor = conn.cursor()
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cursor.execute('UPDATE users SET last_seen = ? WHERE user_id = ?', (now, user_id))
+        cursor.execute('''UPDATE users SET last_seen = CURRENT_TIMESTAMP 
+                        WHERE user_id = ?''', (user_id,))
         conn.commit()
         conn.close()
 
-def increment_chat_requests(user_id):
+def increment_message_count(user_id, chat_id=None):
+    """বার্তা গণনা বৃদ্ধি"""
     with db_lock:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('UPDATE users SET chat_requests = chat_requests + 1 WHERE user_id = ?', (user_id,))
+        cursor.execute('''UPDATE users SET total_messages = total_messages + 1 
+                        WHERE user_id = ?''', (user_id,))
+        if chat_id:
+            cursor.execute('''UPDATE groups SET total_messages = total_messages + 1 
+                            WHERE chat_id = ?''', (chat_id,))
         conn.commit()
         conn.close()
-
-def is_admin(user_id, chat_id=None):
-    if user_id == SUPER_ADMIN: 
-        return True
-    with db_lock:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT target_group FROM admins WHERE user_id = ?', (user_id,))
-        res = cursor.fetchone()
-        conn.close()
-        if res:
-            if chat_id and res[0] != 0 and res[0] != chat_id: 
-                return False
-            return True
-        return False
 
 def get_user_info(user_id):
+    """ব্যবহারকারীর তথ্য প্রাপ্তি"""
     with db_lock:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT username, first_name, last_seen, is_banned, chat_requests FROM users WHERE user_id = ?', (user_id,))
-        res = cursor.fetchone()
+        cursor.execute('''SELECT username, first_name, last_seen, 
+                        is_banned, total_messages, chat_requests, warning_count 
+                        FROM users WHERE user_id = ?''', (user_id,))
+        row = cursor.fetchone()
         conn.close()
-        if res:
+        
+        if row:
             return {
-                "username": res[0] or "No username",
-                "first_name": res[1] or "No name",
-                "last_seen": res[2] or "Never",
-                "is_banned": bool(res[3]),
-                "chat_requests": res[4]
+                "username": row[0] or "No username",
+                "first_name": row[1] or "No name",
+                "last_seen": row[2],
+                "is_banned": bool(row[3]),
+                "total_messages": row[4],
+                "chat_requests": row[5],
+                "warning_count": row[6]
             }
         return None
 
-def toggle_ban_user(user_id):
+def is_admin(user_id, check_super=False):
+    """এডমিন চেক"""
+    if user_id == SUPER_ADMIN:
+        return True
+    
     with db_lock:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT is_banned FROM users WHERE user_id = ?', (user_id,))
-        res = cursor.fetchone()
-        if res:
-            new_status = 0 if res[0] == 1 else 1
-            cursor.execute('UPDATE users SET is_banned = ? WHERE user_id = ?', (new_status, user_id))
-            conn.commit()
-            conn.close()
-            return new_status
+        if check_super:
+            cursor.execute('SELECT is_super FROM admins WHERE user_id = ?', (user_id,))
+        else:
+            cursor.execute('SELECT user_id FROM admins WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
         conn.close()
-        return None
+        return result is not None
 
-def save_user_message(user_id, message_text, message_type):
+def add_admin(user_id, added_by, permissions="view"):
+    """এডমিন যোগ"""
     with db_lock:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('''INSERT INTO user_messages (user_id, message_text, message_type) 
-                          VALUES (?, ?, ?)''', (user_id, message_text, message_type))
+        user_info = get_user_info(user_id)
+        username = user_info["username"] if user_info else ""
+        cursor.execute('''INSERT OR REPLACE INTO admins 
+                        (user_id, username, added_by, permissions) 
+                        VALUES (?, ?, ?, ?)''',
+                     (user_id, username, added_by, permissions))
         conn.commit()
         conn.close()
 
-# ================= KEYBOARDS =================
-def main_admin_keyboard(uid):
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    if uid == SUPER_ADMIN:
-        markup.add(
-            types.InlineKeyboardButton("📂 Group Manager", callback_data="list_groups"),
-            types.InlineKeyboardButton("📋 Admin List", callback_data="admin_list")
-        )
-        markup.add(
-            types.InlineKeyboardButton("➕ Add Admin", callback_data="add_admin"),
-            types.InlineKeyboardButton("➖ Remove Admin", callback_data="del_admin_list")
-        )
-        markup.add(
-            types.InlineKeyboardButton("📢 Global Broadcast", callback_data="bc_all"),
-            types.InlineKeyboardButton("📥 Inbox Messages", callback_data="inbox_list")
-        )
-        markup.add(types.InlineKeyboardButton("✍️ Set Leave Msg", callback_data="set_leave_msg"))
-    else:
-        markup.add(types.InlineKeyboardButton("📂 View Groups", callback_data="list_groups"))
-        markup.add(types.InlineKeyboardButton("📥 Inbox Messages", callback_data="inbox_list"))
-    return markup
+def remove_admin(user_id):
+    """এডমিন অপসারণ"""
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM admins WHERE user_id = ?', (user_id,))
+        conn.commit()
+        conn.close()
 
-def group_control_keyboard(chat_id):
-    m = get_setting(chat_id, 'maintenance')
-    l = get_setting(chat_id, 'link_filter')
-    s = get_setting(chat_id, 'bot_status')
-    
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        types.InlineKeyboardButton(f"{'🔴' if m else '🟢'} Maintenance: {'ON' if m else 'OFF'}", 
-                                   callback_data=f"tog_m_{chat_id}"),
-        types.InlineKeyboardButton(f"{'🟢' if l else '🔴'} Link Filter: {'ON' if l else 'OFF'}", 
-                                   callback_data=f"tog_l_{chat_id}"),
-        types.InlineKeyboardButton(f"{'✅' if s else '⏸'} Bot Status: {'Active' if s else 'Paused'}", 
-                                   callback_data=f"tog_s_{chat_id}"),
-        types.InlineKeyboardButton("📢 Group Broadcast", callback_data=f"bc_{chat_id}"),
-        types.InlineKeyboardButton("🚪 Leave Group", callback_data=f"leave_{chat_id}"),
-        types.InlineKeyboardButton("⬅️ Back", callback_data="list_groups")
-    )
-    return markup
-
-def user_request_keyboard():
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🙋 Request to Chat", callback_data="req_chat"))
-    return markup
-
-def user_menu_keyboard(user_id):
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    user_info = get_user_info(user_id)
-    if user_info and user_info["is_banned"]:
-        markup.add(types.InlineKeyboardButton("🔓 Unban User", callback_data=f"toggle_ban_{user_id}"))
-    else:
-        markup.add(types.InlineKeyboardButton("🔨 Ban User", callback_data=f"toggle_ban_{user_id}"))
-    
-    markup.add(
-        types.InlineKeyboardButton("💬 Start Chat", callback_data=f"start_chat_{user_id}"),
-        types.InlineKeyboardButton("📝 Send Message", callback_data=f"send_msg_{user_id}")
-    )
-    markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data="inbox_list"))
-    return markup
-
-def chat_request_keyboard(user_id):
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("✅ Accept", callback_data=f"accept_req_{user_id}"),
-        types.InlineKeyboardButton("❌ Reject", callback_data=f"reject_req_{user_id}")
-    )
-    return markup
-
-# ================= MESSAGE HANDLERS =================
-@bot.message_handler(func=lambda m: True, content_types=['text', 'photo', 'video', 'document', 'audio', 'sticker'])
-def handle_all(message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    
-    # Update user information
-    register_user(user_id, message.from_user.username, message.from_user.first_name)
-    update_user_last_seen(user_id)
-    
-    # Save user message if not admin
-    if not is_admin(user_id) and message.content_type == 'text' and message.text:
-        save_user_message(user_id, message.text, 'text')
-    
-    # Handle private chat
-    if message.chat.type == "private":
-        # Check if admin is in session with this user
-        admin_id = None
-        for admin, user in active_sessions.items():
-            if user == user_id:
-                admin_id = admin
-                break
+def get_group_info(chat_id):
+    """গ্রুপ তথ্য প্রাপ্তি"""
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''SELECT title, added_date, total_messages, 
+                        link_filter, maintenance_mode, bot_status 
+                        FROM groups WHERE chat_id = ?''', (chat_id,))
+        row = cursor.fetchone()
+        conn.close()
         
-        if admin_id:
-            # Forward user message to admin
-            try:
-                if message.text:
-                    bot.send_message(admin_id, f"👤 *User Message:*\n{message.text}", parse_mode="Markdown")
-                elif message.photo:
-                    bot.send_photo(admin_id, message.photo[-1].file_id, caption=f"👤 User sent photo\nCaption: {message.caption}")
-                elif message.video:
-                    bot.send_video(admin_id, message.video.file_id, caption=f"👤 User sent video\nCaption: {message.caption}")
-                elif message.document:
-                    bot.send_document(admin_id, message.document.file_id, caption=f"👤 User sent document\nCaption: {message.caption}")
-                elif message.audio:
-                    bot.send_audio(admin_id, message.audio.file_id, caption=f"👤 User sent audio")
-                elif message.sticker:
-                    bot.send_sticker(admin_id, message.sticker.file_id)
-                    bot.send_message(admin_id, "👤 User sent a sticker")
-            except Exception as e:
-                print(f"Error forwarding message: {e}")
-            return
-        
-        # Check if user is banned
-        user_info = get_user_info(user_id)
-        if user_info and user_info["is_banned"]:
-            bot.send_message(chat_id, "🚫 You are banned from using this bot.")
-            return
-        
-        # Handle commands
-        if message.text == "/start":
-            welcome_text = f"👋 Hello {message.from_user.first_name}!\n\nWelcome to the bot. You can request to chat with an admin using the button below."
-            bot.send_message(chat_id, welcome_text, reply_markup=user_request_keyboard())
-        
-        elif message.text == "/admin":
-            if is_admin(user_id):
-                bot.send_message(chat_id, "🏮 **Admin Control Panel**", 
-                               reply_markup=main_admin_keyboard(user_id), parse_mode="Markdown")
-            else:
-                bot.send_message(chat_id, "⚠️ You are not an admin.")
-        else:
-            # If user sends any other message
-            if not is_admin(user_id):
-                bot.send_message(chat_id, "Please use the buttons below to interact with the bot.", 
-                               reply_markup=user_request_keyboard())
+        if row:
+            return {
+                "title": row[0],
+                "added_date": row[1],
+                "total_messages": row[2],
+                "link_filter": bool(row[3]),
+                "maintenance_mode": bool(row[4]),
+                "bot_status": bool(row[5])
+            }
+        return None
+
+def update_group_setting(chat_id, setting, value):
+    """গ্রুপ সেটিং আপডেট"""
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(f'UPDATE groups SET {setting} = ? WHERE chat_id = ?', (value, chat_id))
+        conn.commit()
+        conn.close()
+
+def save_message(user_id, chat_id, message_text, message_type):
+    """বার্তা সংরক্ষণ"""
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''INSERT INTO messages 
+                        (user_id, chat_id, message_text, message_type) 
+                        VALUES (?, ?, ?, ?)''',
+                     (user_id, chat_id, message_text, message_type))
+        conn.commit()
+        conn.close()
+
+# ================= CHAT SESSION MANAGEMENT =================
+def start_chat_session(admin_id, user_id):
+    """চ্যাট সেশন শুরু"""
+    active_sessions[admin_id] = user_id
+    active_sessions[user_id] = admin_id
     
-    # Handle group messages
-    else:
-        # Update group info
+    # সেশন লগ সংরক্ষণ
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''INSERT INTO sessions (admin_id, user_id, start_time) 
+                        VALUES (?, ?, CURRENT_TIMESTAMP)''',
+                     (admin_id, user_id))
+        conn.commit()
+        conn.close()
+    
+    return cursor.lastrowid
+
+def end_chat_session(user_id):
+    """চ্যাট সেশন শেষ"""
+    partner_id = active_sessions.get(user_id)
+    
+    if partner_id:
+        # সেশন শেষ করা
+        del active_sessions[user_id]
+        if partner_id in active_sessions:
+            del active_sessions[partner_id]
+        
+        # লগ আপডেট
         with db_lock:
             conn = get_db_connection()
             cursor = conn.cursor()
-            cursor.execute('INSERT OR REPLACE INTO groups (chat_id, title) VALUES (?, ?)', 
+            cursor.execute('''UPDATE sessions SET end_time = CURRENT_TIMESTAMP 
+                            WHERE (admin_id = ? AND user_id = ?) 
+                            OR (admin_id = ? AND user_id = ?) 
+                            ORDER BY start_time DESC LIMIT 1''',
+                         (user_id, partner_id, partner_id, user_id))
+            conn.commit()
+            conn.close()
+        
+        return partner_id
+    return None
+
+def get_active_session_partner(user_id):
+    """সক্রিয় সেশন পার্টনার খুঁজুন"""
+    return active_sessions.get(user_id)
+
+# ================= KEYBOARDS =================
+def main_menu_keyboard(user_id):
+    """প্রধান মেনু কীবোর্ড"""
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    
+    if is_admin(user_id):
+        markup.add("📊 ড্যাশবোর্ড", "👥 ব্যবহারকারী")
+        markup.add("📢 ব্রডকাস্ট", "⚙️ সেটিংস")
+        markup.add("ℹ️ সাহায্য", "🚪 লগআউট")
+        
+        if user_id in active_sessions:
+            markup.add("🔴 সেশন শেষ করুন")
+    else:
+        markup.add("🙋‍♂️ সাহায্য চাই", "📞 যোগাযোগ")
+        markup.add("ℹ️ তথ্য", "⭐ রেট দিন")
+        
+        if user_id in active_sessions:
+            markup.add("🔴 চ্যাট শেষ করুন")
+    
+    return markup
+
+def admin_dashboard_keyboard():
+    """এডমিন ড্যাশবোর্ড কীবোর্ড"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    
+    markup.add(
+        types.InlineKeyboardButton("📈 পরিসংখ্যান", callback_data="stats"),
+        types.InlineKeyboardButton("👥 ইউজার ম্যানেজ", callback_data="user_manage")
+    )
+    markup.add(
+        types.InlineKeyboardButton("📢 ব্রডকাস্ট", callback_data="broadcast"),
+        types.InlineKeyboardButton("⚙️ গ্রুপ সেটিং", callback_data="group_settings")
+    )
+    markup.add(
+        types.InlineKeyboardButton("➕ এডমিন যোগ", callback_data="add_admin"),
+        types.InlineKeyboardButton("➖ এডমিন অপসারণ", callback_data="remove_admin")
+    )
+    markup.add(
+        types.InlineKeyboardButton("📋 লগ দেখুন", callback_data="view_logs"),
+        types.InlineKeyboardButton("🔄 আপডেট", callback_data="refresh")
+    )
+    
+    return markup
+
+def user_management_keyboard():
+    """ব্যবহারকারী ব্যবস্থাপনা কীবোর্ড"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    
+    markup.add(
+        types.InlineKeyboardButton("🔍 ইউজার খুঁজুন", callback_data="search_user"),
+        types.InlineKeyboardButton("📊 সকল ইউজার", callback_data="all_users")
+    )
+    markup.add(
+        types.InlineKeyboardButton("🔨 ব্যান ইউজার", callback_data="ban_user"),
+        types.InlineKeyboardButton("✅ আনবেন", callback_data="unban_user")
+    )
+    markup.add(
+        types.InlineKeyboardButton("💬 চ্যাট শুরু", callback_data="start_chat"),
+        types.InlineKeyboardButton("📝 বার্তা পাঠান", callback_data="send_message")
+    )
+    markup.add(
+        types.InlineKeyboardButton("⚠️ সতর্কতা", callback_data="warn_user"),
+        types.InlineKeyboardButton("📋 রিকোয়েস্ট", callback_data="view_requests")
+    )
+    markup.add(
+        types.InlineKeyboardButton("⬅️ পিছনে", callback_data="back_to_dashboard")
+    )
+    
+    return markup
+
+def broadcast_keyboard():
+    """ব্রডকাস্ট কীবোর্ড"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    
+    markup.add(
+        types.InlineKeyboardButton("🌍 সকল গ্রুপ", callback_data="bc_all_groups"),
+        types.InlineKeyboardButton("👥 সকল ইউজার", callback_data="bc_all_users")
+    )
+    markup.add(
+        types.InlineKeyboardButton("📍 নির্দিষ্ট গ্রুপ", callback_data="bc_specific_group"),
+        types.InlineKeyboardButton("👤 নির্দিষ্ট ইউজার", callback_data="bc_specific_user")
+    )
+    markup.add(
+        types.InlineKeyboardButton("📅 সময়সূচি", callback_data="schedule_bc"),
+        types.InlineKeyboardButton("📋 ইতিহাস", callback_data="bc_history")
+    )
+    markup.add(
+        types.InlineKeyboardButton("⬅️ পিছনে", callback_data="back_to_dashboard")
+    )
+    
+    return markup
+
+def group_settings_keyboard(chat_id=None):
+    """গ্রুপ সেটিংস কীবোর্ড"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    
+    if chat_id:
+        group = get_group_info(chat_id)
+        link_status = "✅" if group["link_filter"] else "❌"
+        maint_status = "✅" if group["maintenance_mode"] else "❌"
+        bot_status = "✅" if group["bot_status"] else "❌"
+        
+        markup.add(
+            types.InlineKeyboardButton(f"{link_status} লিংক ফিল্টার", 
+                                     callback_data=f"toggle_link_{chat_id}"),
+            types.InlineKeyboardButton(f"{maint_status} মেইনটেনেন্স", 
+                                     callback_data=f"toggle_maint_{chat_id}")
+        )
+        markup.add(
+            types.InlineKeyboardButton(f"{bot_status} বট স্ট্যাটাস", 
+                                     callback_data=f"toggle_bot_{chat_id}"),
+            types.InlineKeyboardButton("📝 ওয়েলকাম মেসেজ", 
+                                     callback_data=f"set_welcome_{chat_id}")
+        )
+        markup.add(
+            types.InlineKeyboardButton("📋 নিয়ম", callback_data=f"set_rules_{chat_id}"),
+            types.InlineKeyboardButton("🚪 লিভ মেসেজ", callback_data=f"set_leave_{chat_id}")
+        )
+        markup.add(
+            types.InlineKeyboardButton("📊 পরিসংখ্যান", callback_data=f"group_stats_{chat_id}"),
+            types.InlineKeyboardButton("👮‍♂️ অ্যাডমিন", callback_data=f"group_admins_{chat_id}")
+        )
+        markup.add(
+            types.InlineKeyboardButton("🗑 গ্রুপ মুছুন", callback_data=f"delete_group_{chat_id}"),
+            types.InlineKeyboardButton("🚪 গ্রুপ ছাড়ুন", callback_data=f"leave_group_{chat_id}")
+        )
+    else:
+        markup.add(
+            types.InlineKeyboardButton("📂 গ্রুপ তালিকা", callback_data="list_groups"),
+            types.InlineKeyboardButton("➕ নতুন গ্রুপ", callback_data="add_group")
+        )
+    
+    markup.add(types.InlineKeyboardButton("⬅️ পিছনে", callback_data="back_to_dashboard"))
+    
+    return markup
+
+def session_control_keyboard(partner_id=None):
+    """সেশন কন্ট্রোল কীবোর্ড"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    
+    markup.add(
+        types.InlineKeyboardButton("📎 ফাইল পাঠান", callback_data="send_file"),
+        types.InlineKeyboardButton("🖼 ছবি পাঠান", callback_data="send_photo")
+    )
+    markup.add(
+        types.InlineKeyboardButton("🎥 ভিডিও পাঠান", callback_data="send_video"),
+        types.InlineKeyboardButton("📄 ডকুমেন্ট", callback_data="send_doc")
+    )
+    markup.add(
+        types.InlineKeyboardButton("📋 লগ", callback_data="view_chat_log"),
+        types.InlineKeyboardButton("⏸ বিরতি", callback_data="pause_chat")
+    )
+    markup.add(
+        types.InlineKeyboardButton("🔴 সেশন শেষ", callback_data="end_session"),
+        types.InlineKeyboardButton("🚪 প্রস্থান", callback_data="exit_chat")
+    )
+    
+    return markup
+
+def user_request_keyboard(user_id):
+    """ব্যবহারকারীর রিকোয়েস্ট কীবোর্ড"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    
+    markup.add(
+        types.InlineKeyboardButton("✅ গ্রহণ করুন", callback_data=f"accept_{user_id}"),
+        types.InlineKeyboardButton("❌ প্রত্যাখ্যান", callback_data=f"reject_{user_id}")
+    )
+    markup.add(
+        types.InlineKeyboardButton("⏰ পরে দেখুন", callback_data=f"snooze_{user_id}"),
+        types.InlineKeyboardButton("🔍 তথ্য দেখুন", callback_data=f"info_{user_id}")
+    )
+    
+    return markup
+
+def confirm_keyboard(action, target_id):
+    """কনফার্মেশন কীবোর্ড"""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    
+    markup.add(
+        types.InlineKeyboardButton("✅ হ্যাঁ", callback_data=f"confirm_{action}_{target_id}"),
+        types.InlineKeyboardButton("❌ না", callback_data=f"cancel_{action}_{target_id}")
+    )
+    
+    return markup
+
+# ================= MESSAGE HANDLERS =================
+@bot.message_handler(commands=['start', 'help', 'menu'])
+def handle_start(message):
+    """শুরু, সাহায্য, মেনু কমান্ড"""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    # ব্যবহারকারী নিবন্ধন
+    register_user(user_id, message.from_user.username, 
+                  message.from_user.first_name, message.from_user.last_name)
+    update_user_last_seen(user_id)
+    
+    if message.chat.type == "private":
+        if message.text == "/start":
+            welcome_msg = f"""
+🎉 স্বাগতম {message.from_user.first_name}!
+
+🤖 *বট বৈশিষ্ট্য সমূহ:*
+• এডমিনের সাথে সরাসরি চ্যাট
+• গ্রুপ ম্যানেজমেন্ট
+• স্বয়ংক্রিয় মডারেশন
+• ব্রডকাস্ট সিস্টেম
+• এবং আরও অনেক কিছু!
+
+⚡ *কমান্ড সমূহ:*
+/start - শুরু করুন
+/help - সাহায্য পান
+/menu - প্রধান মেনু
+/stats - পরিসংখ্যান
+/settings - সেটিংস
+
+📞 সাহায্যের জন্য: @YourSupport
+"""
+            bot.send_message(chat_id, welcome_msg, parse_mode="Markdown", 
+                           reply_markup=main_menu_keyboard(user_id))
+        
+        elif message.text == "/menu":
+            if is_admin(user_id):
+                bot.send_message(chat_id, "📊 *এডমিন ড্যাশবোর্ড*", 
+                               parse_mode="Markdown", reply_markup=admin_dashboard_keyboard())
+            else:
+                bot.send_message(chat_id, "🏠 *প্রধান মেনু*", 
+                               parse_mode="Markdown", reply_markup=main_menu_keyboard(user_id))
+        
+        elif message.text == "/help":
+            help_msg = """
+🆘 *সাহায্য কেন্দ্র*
+
+📞 *যোগাযোগ:*
+• সরাসরি সাহায্য: @YourSupport
+• রিপোর্ট সমস্যা: /report
+• পরামর্শ: /suggest
+
+⚡ *দ্রুত কমান্ড:*
+/start - বট শুরু করুন
+/menu - মেনু দেখুন
+/stats - পরিসংখ্যান দেখুন
+/settings - সেটিংস
+
+🔧 *সহায়িকা:*
+1. এডমিনের সাথে কথা বলতে "সাহায্য চাই" বাটন ক্লিক করুন
+2. অপেক্ষা করুন এডমিনের প্রতিক্রিয়ার জন্য
+3. সরাসরি চ্যাট শুরু হলে নিয়মিত যোগাযোগ করুন
+
+⚠️ *নিয়ম:*
+• অশালীন ভাষা ব্যবহার নিষিদ্ধ
+• স্প্যাম করবেন না
+• এডমিনের নির্দেশনা মেনে চলুন
+"""
+            bot.send_message(chat_id, help_msg, parse_mode="Markdown")
+
+@bot.message_handler(func=lambda m: m.text == "📊 ড্যাশবোর্ড")
+def handle_dashboard(message):
+    """ড্যাশবোর্ড হ্যান্ডলার"""
+    user_id = message.from_user.id
+    
+    if is_admin(user_id):
+        # পরিসংখ্যান সংগ্রহ
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # মোট ব্যবহারকারী
+            cursor.execute('SELECT COUNT(*) FROM users')
+            total_users = cursor.fetchone()[0]
+            
+            # মোট গ্রুপ
+            cursor.execute('SELECT COUNT(*) FROM groups')
+            total_groups = cursor.fetchone()[0]
+            
+            # আজকের বার্তা
+            cursor.execute('''SELECT COUNT(*) FROM messages 
+                            WHERE DATE(timestamp) = DATE('now')''')
+            today_messages = cursor.fetchone()[0]
+            
+            # সক্রিয় সেশন
+            active_sessions_count = len(active_sessions) // 2
+            
+            conn.close()
+        
+        stats_msg = f"""
+📊 *সিস্টেম পরিসংখ্যান*
+
+👥 *ব্যবহারকারী:* {total_users}
+📂 *গ্রুপ:* {total_groups}
+💬 *আজকের বার্তা:* {today_messages}
+💬 *সক্রিয় সেশন:* {active_sessions_count}
+
+📈 *দ্রুত অ্যাকশন:*
+1️⃣ গ্রুপ ম্যানেজমেন্ট
+2️⃣ ব্রডকাস্ট পাঠান
+3️⃣ ইউজার দেখুন
+4️⃣ সেটিংস পরিবর্তন
+"""
+        bot.send_message(message.chat.id, stats_msg, parse_mode="Markdown",
+                       reply_markup=admin_dashboard_keyboard())
+    else:
+        bot.send_message(message.chat.id, "⚠️ আপনার এডমিন এক্সেস নেই!",
+                       reply_markup=main_menu_keyboard(user_id))
+
+@bot.message_handler(func=lambda m: m.text == "👥 ব্যবহারকারী")
+def handle_users(message):
+    """ব্যবহারকারী ম্যানেজমেন্ট"""
+    user_id = message.from_user.id
+    
+    if is_admin(user_id):
+        bot.send_message(message.chat.id, "👥 *ব্যবহারকারী ব্যবস্থাপনা*",
+                       parse_mode="Markdown", reply_markup=user_management_keyboard())
+    else:
+        bot.send_message(message.chat.id, "⚠️ অনুমতি প্রয়োজন!")
+
+@bot.message_handler(func=lambda m: m.text == "📢 ব্রডকাস্ট")
+def handle_broadcast(message):
+    """ব্রডকাস্ট হ্যান্ডলার"""
+    user_id = message.from_user.id
+    
+    if is_admin(user_id):
+        bot.send_message(message.chat.id, "📢 *ব্রডকাস্ট সিস্টেম*",
+                       parse_mode="Markdown", reply_markup=broadcast_keyboard())
+    else:
+        bot.send_message(message.chat.id, "⚠️ অনুমতি প্রয়োজন!")
+
+@bot.message_handler(func=lambda m: m.text == "⚙️ সেটিংস")
+def handle_settings(message):
+    """সেটিংস হ্যান্ডলার"""
+    user_id = message.from_user.id
+    
+    if is_admin(user_id):
+        bot.send_message(message.chat.id, "⚙️ *গ্রুপ সেটিংস*",
+                       parse_mode="Markdown", reply_markup=group_settings_keyboard())
+    else:
+        # সাধারণ ব্যবহারকারীর সেটিংস
+        settings_msg = """
+⚙️ *আপনার সেটিংস*
+
+🔔 *বিজ্ঞপ্তি:* সক্রিয়
+🌐 *ভাষা:* বাংলা
+🎨 *থিম:* ডিফল্ট
+
+🔧 *অন্যান্য:*
+• প্রাইভেসি সেটিংস
+• ডাটা ব্যবহার
+• সাহায্য ও সমর্থন
+"""
+        bot.send_message(message.chat.id, settings_msg, parse_mode="Markdown")
+
+@bot.message_handler(func=lambda m: m.text == "🙋‍♂️ সাহায্য চাই")
+def handle_help_request(message):
+    """সাহায্য অনুরোধ"""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    # কো-ওল্ডাউন চেক
+    now = time.time()
+    if user_id in cooldowns and now - cooldowns[user_id] < 300:  # 5 মিনিট
+        remaining = int((300 - (now - cooldowns[user_id])) / 60)
+        bot.send_message(chat_id, f"⚠️ অনুগ্রহ করে {remaining} মিনিট পরে আবার চেষ্টা করুন।")
+        return
+    
+    cooldowns[user_id] = now
+    
+    # রিকোয়েস্ট স্টোর
+    chat_requests[user_id] = {
+        "time": now,
+        "status": "pending",
+        "name": message.from_user.first_name,
+        "username": message.from_user.username
+    }
+    
+    # বার্তা প্রস্তুত
+    request_msg = f"""
+🚨 *নতুন সাহায্য অনুরোধ!*
+
+👤 *ব্যবহারকারী:* {message.from_user.first_name}
+📱 *ইউজারনেম:* @{message.from_user.username or 'N/A'}
+🆔 *আইডি:* `{user_id}`
+⏰ *সময়:* {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+📞 *দ্রুত প্রতিক্রিয়া প্রয়োজন!*
+"""
+    
+    # সুপার এডমিনকে নোটিফাই
+    try:
+        bot.send_message(SUPER_ADMIN, request_msg, parse_mode="Markdown",
+                       reply_markup=user_request_keyboard(user_id))
+    except:
+        pass
+    
+    # অন্যান্য এডমিনদের নোটিফাই
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        admins = cursor.execute('SELECT user_id FROM admins WHERE user_id != ?', (SUPER_ADMIN,)).fetchall()
+        conn.close()
+    
+    for admin in admins:
+        try:
+            bot.send_message(admin[0], request_msg, parse_mode="Markdown")
+        except:
+            pass
+    
+    # ব্যবহারকারীকে কনফার্মেশন
+    bot.send_message(chat_id, "✅ আপনার অনুরোধ পাঠানো হয়েছে! একজন এডমিন শীঘ্রই আপনার সাথে যোগাযোগ করবেন।")
+
+@bot.message_handler(func=lambda m: m.text == "🔴 সেশন শেষ করুন")
+def handle_end_session(message):
+    """সেশন শেষ"""
+    user_id = message.from_user.id
+    
+    if user_id in active_sessions:
+        partner_id = end_chat_session(user_id)
+        if partner_id:
+            # দুজনকেই নোটিফাই
+            bot.send_message(user_id, "✅ চ্যাট সেশন সফলভাবে শেষ হয়েছে।")
+            try:
+                bot.send_message(partner_id, "ℹ️ অন্য পক্ষ চ্যাট সেশন শেষ করেছেন।")
+            except:
+                pass
+        else:
+            bot.send_message(user_id, "❌ সেশন শেষ করতে সমস্যা হয়েছে।")
+    else:
+        bot.send_message(user_id, "ℹ️ আপনার কোনো সক্রিয় চ্যাট সেশন নেই।")
+
+@bot.message_handler(content_types=['text', 'photo', 'video', 'document', 'audio'])
+def handle_all_messages(message):
+    """সকল বার্তা হ্যান্ডলার"""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    # সর্বশেষ দেখা আপডেট
+    update_user_last_seen(user_id)
+    
+    # বার্তা গণনা বৃদ্ধি
+    increment_message_count(user_id, chat_id if message.chat.type != "private" else None)
+    
+    # চ্যাট সেশন চেক
+    if message.chat.type == "private" and user_id in active_sessions:
+        partner_id = active_sessions[user_id]
+        
+        # বার্তা ফরওয়ার্ড
+        try:
+            if message.text:
+                bot.send_message(partner_id, f"💬 *ব্যবহারকারীর বার্তা:*\n\n{message.text}", parse_mode="Markdown")
+            elif message.photo:
+                bot.send_photo(partner_id, message.photo[-1].file_id, 
+                             caption=f"📸 ব্যবহারকারীর ছবি\n\n{message.caption or ''}")
+            elif message.video:
+                bot.send_video(partner_id, message.video.file_id,
+                             caption=f"🎥 ব্যবহারকারীর ভিডিও\n\n{message.caption or ''}")
+            elif message.document:
+                bot.send_document(partner_id, message.document.file_id,
+                                caption=f"📄 ব্যবহারকারীর ডকুমেন্ট\n\n{message.caption or ''}")
+            elif message.audio:
+                bot.send_audio(partner_id, message.audio.file_id,
+                             caption="🎵 ব্যবহারকারীর অডিও")
+            
+            # বার্তা লগ
+            save_message(user_id, chat_id, 
+                        message.text or message.caption or "Media file", 
+                        message.content_type)
+        except Exception as e:
+            bot.send_message(user_id, f"❌ বার্তা পাঠাতে সমস্যা: {str(e)}")
+        
+        return
+    
+    # গ্রুপ বার্তা হ্যান্ডলিং
+    if message.chat.type != "private":
+        # গ্রুপ ডাটাবেসে সংরক্ষণ
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('''INSERT OR IGNORE INTO groups 
+                            (chat_id, title) VALUES (?, ?)''',
                          (chat_id, message.chat.title))
             conn.commit()
             conn.close()
         
-        # Check bot status
-        if get_setting(chat_id, 'bot_status') == 0:
-            return
-        
-        # Check maintenance mode
-        if get_setting(chat_id, 'maintenance') == 1 and not is_admin(user_id, chat_id):
-            try:
-                bot.delete_message(chat_id, message.message_id)
-            except:
-                pass
-            return
-        
-        # Check link filter
-        if get_setting(chat_id, 'link_filter') == 1:
-            text = message.text or message.caption or ""
-            if ("http://" in text.lower() or "https://" in text.lower() or "t.me/" in text.lower()) and not is_admin(user_id, chat_id):
+        # গ্রুপ সেটিংস চেক
+        group = get_group_info(chat_id)
+        if group:
+            # মেইনটেনেন্স মোড চেক
+            if group["maintenance_mode"] and not is_admin(user_id):
                 try:
                     bot.delete_message(chat_id, message.message_id)
-                    bot.send_message(chat_id, 
-                                   f"@{message.from_user.username or message.from_user.first_name} হ্যাঁ ভাই🙂, উরাধুরা লিংক দাও, জায়গাটা কি তোমার বাপ কিনা রাখছে? 😒")
+                    bot.send_message(chat_id, "🔧 গ্রুপটি বর্তমানে মেইনটেনেন্স মোডে আছে।")
                 except:
                     pass
+                return
+            
+            # লিংক ফিল্টার চেক
+            if group["link_filter"] and not is_admin(user_id):
+                text = message.text or message.caption or ""
+                if any(link in text.lower() for link in ["http://", "https://", "t.me/", "www."]):
+                    try:
+                        bot.delete_message(chat_id, message.message_id)
+                        warning_msg = f"""
+⚠️ @{message.from_user.username or message.from_user.first_name}
+লিংক শেয়ার করার অনুমতি নেই!
+                        """
+                        bot.send_message(chat_id, warning_msg)
+                    except:
+                        pass
+                    return
+            
+            # বট স্ট্যাটাস চেক
+            if not group["bot_status"]:
+                return
+        
+        # ওয়েলকাম মেসেজ (নতুন সদস্য)
+        if message.new_chat_members:
+            for member in message.new_chat_members:
+                if member.id == bot.get_me().id:
+                    welcome_msg = group["welcome_message"] if group else "🤖 বটটি সফলভাবে যোগ দেওয়া হয়েছে!"
+                    bot.send_message(chat_id, welcome_msg)
+                else:
+                    welcome_user = group["welcome_message"] if group else f"🎉 স্বাগতম {member.first_name}!"
+                    bot.send_message(chat_id, welcome_user)
 
 # ================= CALLBACK HANDLERS =================
 @bot.callback_query_handler(func=lambda call: True)
-def callback_logic(call):
+def handle_callbacks(call):
+    """সকল কলব্যাক হ্যান্ডলার"""
     user_id = call.from_user.id
     chat_id = call.message.chat.id
     message_id = call.message.message_id
     
-    # Handle chat request from user
-    if call.data == "req_chat":
-        # Check if user is banned
-        user_info = get_user_info(user_id)
-        if user_info and user_info["is_banned"]:
-            bot.answer_callback_query(call.id, "🚫 You are banned from requesting chat.", show_alert=True)
-            return
-        
-        # Check cooldown
-        now = time.time()
-        if user_id in cooldowns and now - cooldowns[user_id] < 600:
-            remaining = int((600 - (now - cooldowns[user_id])) / 60)
-            bot.answer_callback_query(call.id, f"Please wait {remaining} minutes before requesting again.", show_alert=True)
-            return
-        
-        # Set cooldown
-        cooldowns[user_id] = now
-        
-        # Store request
-        chat_requests[user_id] = {
-            "time": now,
-            "status": "pending",
-            "name": call.from_user.first_name,
-            "username": call.from_user.username
-        }
-        
-        # Update database
-        increment_chat_requests(user_id)
-        
-        # Notify user
-        bot.edit_message_text("✅ Your chat request has been sent to admins. Please wait for a response.", 
-                            chat_id, message_id)
-        
-        # Send notification to SUPER_ADMIN
-        user_info = get_user_info(user_id)
-        request_text = f"🙋 **New Chat Request!**\n\n"
-        request_text += f"👤 Name: {call.from_user.first_name}\n"
-        if call.from_user.username:
-            request_text += f"📱 Username: @{call.from_user.username}\n"
-        request_text += f"🆔 ID: `{user_id}`\n"
-        request_text += f"📅 Last Seen: {user_info['last_seen'] if user_info else 'Unknown'}\n"
-        request_text += f"📞 Total Requests: {user_info['chat_requests'] if user_info else 0}"
-        
-        try:
-            bot.send_message(SUPER_ADMIN, request_text, 
-                           reply_markup=chat_request_keyboard(user_id), parse_mode="Markdown")
-        except:
-            pass
-        
-        # Also notify other admins
-        with db_lock:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            admins = cursor.execute('SELECT user_id FROM admins').fetchall()
-            conn.close()
-        
-        for admin in admins:
-            if admin[0] != SUPER_ADMIN:
-                try:
-                    bot.send_message(admin[0], request_text, parse_mode="Markdown")
-                except:
-                    pass
+    # কলব্যাক ডাটা পার্স
+    data = call.data
+    parts = data.split('_')
     
-    # Handle admin accepting chat request
-    elif call.data.startswith("accept_req_"):
-        if not is_admin(user_id):
-            return
-        
-        target_user_id = int(call.data.split("_")[2])
-        
-        # Update request status
-        if target_user_id in chat_requests:
-            chat_requests[target_user_id]["status"] = "accepted"
-        
-        # Start session
-        active_sessions[user_id] = target_user_id
-        active_sessions[target_user_id] = user_id
-        
-        # Notify admin
-        bot.edit_message_text(f"✅ Chat session started with user `{target_user_id}`.\n\nYou can now chat with the user directly.", 
-                            chat_id, message_id, parse_mode="Markdown")
-        
-        # Notify user
-        try:
-            bot.send_message(target_user_id, "✅ Your chat request has been accepted! You can now chat with the admin.")
-        except:
-            pass
-    
-    # Handle admin rejecting chat request
-    elif call.data.startswith("reject_req_"):
-        if not is_admin(user_id):
-            return
-        
-        target_user_id = int(call.data.split("_")[2])
-        
-        # Update request status
-        if target_user_id in chat_requests:
-            chat_requests[target_user_id]["status"] = "rejected"
-        
-        # Notify admin
-        bot.edit_message_text(f"❌ Chat request from user `{target_user_id}` has been rejected.", 
-                            chat_id, message_id, parse_mode="Markdown")
-        
-        # Notify user
-        try:
-            bot.send_message(target_user_id, "❌ Your chat request has been rejected by the admin.")
-        except:
-            pass
-    
-    # Handle admin panel navigation
-    elif call.data == "back_main":
-        if not is_admin(user_id):
-            return
-        bot.edit_message_text("🏮 **Admin Control Panel**", chat_id, message_id, 
-                            reply_markup=main_admin_keyboard(user_id), parse_mode="Markdown")
-    
-    elif call.data == "list_groups":
-        if not is_admin(user_id):
-            return
-        
-        with db_lock:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT chat_id, title FROM groups')
-            rows = cursor.fetchall()
-            conn.close()
-        
-        if not rows:
-            bot.edit_message_text("📭 No groups found.", chat_id, message_id)
-            return
-        
-        markup = types.InlineKeyboardMarkup()
-        for row in rows:
-            group_id, title = row
-            if is_admin(user_id, group_id):
-                markup.add(types.InlineKeyboardButton(f"📍 {title[:30]}", callback_data=f"mng_{group_id}"))
-        
-        if markup.keyboard:
-            markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
-            bot.edit_message_text("📂 **Manage Groups:**", chat_id, message_id, reply_markup=markup)
-        else:
-            bot.edit_message_text("📭 No groups available for you to manage.", chat_id, message_id)
-    
-    elif call.data.startswith("mng_"):
-        if not is_admin(user_id):
-            return
-        
-        target_id = int(call.data.split("_")[1])
-        if not is_admin(user_id, target_id):
-            bot.answer_callback_query(call.id, "You don't have permission to manage this group.", show_alert=True)
-            return
-        
-        group_info = ""
-        with db_lock:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT title FROM groups WHERE chat_id = ?', (target_id,))
-            res = cursor.fetchone()
-            if res:
-                group_info = res[0]
-            conn.close()
-        
-        bot.edit_message_text(f"⚙️ **Group Settings for:** {group_info}\n🆔 `{target_id}`", 
-                            chat_id, message_id, reply_markup=group_control_keyboard(target_id), parse_mode="Markdown")
-    
-    elif call.data.startswith("tog_"):
-        if not is_admin(user_id):
-            return
-        
-        parts = call.data.split("_")
-        setting_type = parts[1]
-        target_id = int(parts[2])
-        
-        if not is_admin(user_id, target_id):
-            bot.answer_callback_query(call.id, "Permission denied.", show_alert=True)
-            return
-        
-        key_map = {'m': 'maintenance', 'l': 'link_filter', 's': 'bot_status'}
-        new_val = toggle_setting(target_id, key_map[setting_type])
-        
-        bot.edit_message_reply_markup(chat_id, message_id, reply_markup=group_control_keyboard(target_id))
-    
-    elif call.data.startswith("leave_"):
-        if not is_admin(user_id) or user_id != SUPER_ADMIN:
-            bot.answer_callback_query(call.id, "Only Super Admin can remove bot from groups.", show_alert=True)
-            return
-        
-        target_id = int(call.data.split("_")[1])
-        leave_msg = get_setting(target_id, 'leave_msg')
-        
-        try:
-            # Send leave message
-            if leave_msg:
-                bot.send_message(target_id, leave_msg)
+    try:
+        if data == "stats":
+            # পরিসংখ্যান দেখান
+            show_statistics(call)
             
-            # Leave group
+        elif data == "user_manage":
+            # ব্যবহারকারী ব্যবস্থাপনা
+            bot.edit_message_text("👥 *ব্যবহারকারী ব্যবস্থাপনা*", chat_id, message_id,
+                                parse_mode="Markdown", reply_markup=user_management_keyboard())
+        
+        elif data == "broadcast":
+            # ব্রডকাস্ট মেনু
+            bot.edit_message_text("📢 *ব্রডকাস্ট সিস্টেম*", chat_id, message_id,
+                                parse_mode="Markdown", reply_markup=broadcast_keyboard())
+        
+        elif data == "group_settings":
+            # গ্রুপ সেটিংস
+            bot.edit_message_text("⚙️ *গ্রুপ সেটিংস*", chat_id, message_id,
+                                parse_mode="Markdown", reply_markup=group_settings_keyboard())
+        
+        elif data == "add_admin":
+            # এডমিন যোগ
+            msg = bot.send_message(chat_id, "➕ *নতুন এডমিন যোগ করুন*\n\nইউজার আইডি পাঠান:", parse_mode="Markdown")
+            bot.register_next_step_handler(msg, process_add_admin)
+        
+        elif data == "remove_admin":
+            # এডমিন অপসারণ
+            show_admin_list_for_removal(call)
+        
+        elif data == "back_to_dashboard":
+            # ড্যাশবোর্ডে ফিরে যান
+            bot.edit_message_text("📊 *এডমিন ড্যাশবোর্ড*", chat_id, message_id,
+                                parse_mode="Markdown", reply_markup=admin_dashboard_keyboard())
+        
+        elif data.startswith("accept_"):
+            # রিকোয়েস্ট গ্রহণ
+            target_user = int(data.split('_')[1])
+            accept_chat_request(call, target_user)
+        
+        elif data.startswith("reject_"):
+            # রিকোয়েস্ট প্রত্যাখ্যান
+            target_user = int(data.split('_')[1])
+            reject_chat_request(call, target_user)
+        
+        elif data == "end_session":
+            # সেশন শেষ
+            end_session_callback(call)
+        
+        elif data.startswith("toggle_link_"):
+            # লিংক ফিল্টার টগল
+            target_group = int(data.split('_')[2])
+            toggle_group_setting(call, target_group, "link_filter")
+        
+        elif data.startswith("toggle_maint_"):
+            # মেইনটেনেন্স টগল
+            target_group = int(data.split('_')[2])
+            toggle_group_setting(call, target_group, "maintenance_mode")
+        
+        elif data.startswith("toggle_bot_"):
+            # বট স্ট্যাটাস টগল
+            target_group = int(data.split('_')[2])
+            toggle_group_setting(call, target_group, "bot_status")
+        
+        elif data == "list_groups":
+            # গ্রুপ তালিকা
+            list_all_groups(call)
+        
+        elif data.startswith("leave_group_"):
+            # গ্রুপ ছাড়ুন
+            target_group = int(data.split('_')[2])
+            leave_group_confirmation(call, target_group)
+        
+        elif data == "bc_all_groups":
+            # সকল গ্রুপে ব্রডকাস্ট
+            start_broadcast_to_all_groups(call)
+        
+        elif data == "bc_all_users":
+            # সকল ব্যবহারকারীকে ব্রডকাস্ট
+            start_broadcast_to_all_users(call)
+        
+        elif data.startswith("confirm_"):
+            # কনফার্মেশন হ্যান্ডল
+            handle_confirmation(call, data)
+        
+        elif data.startswith("cancel_"):
+            # ক্যান্সেল হ্যান্ডল
+            bot.answer_callback_query(call.id, "❌ অপারেশন বাতিল করা হয়েছে।")
+        
+        else:
+            bot.answer_callback_query(call.id, "ℹ️ এই বৈশিষ্ট্যটি শীঘ্রই আসছে!")
+    
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"❌ ত্রুটি: {str(e)}")
+
+# ================= SPECIFIC FUNCTIONS =================
+def show_statistics(call):
+    """পরিসংখ্যান দেখান"""
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # মোট ব্যবহারকারী
+        cursor.execute('SELECT COUNT(*) FROM users')
+        total_users = cursor.fetchone()[0]
+        
+        # সক্রিয় ব্যবহারকারী (সর্বশেষ 24 ঘন্টা)
+        cursor.execute('''SELECT COUNT(*) FROM users 
+                        WHERE last_seen > datetime('now', '-1 day')''')
+        active_users = cursor.fetchone()[0]
+        
+        # মোট গ্রুপ
+        cursor.execute('SELECT COUNT(*) FROM groups')
+        total_groups = cursor.fetchone()[0]
+        
+        # আজকের বার্তা
+        cursor.execute('''SELECT COUNT(*) FROM messages 
+                        WHERE DATE(timestamp) = DATE('now')''')
+        today_messages = cursor.fetchone()[0]
+        
+        # সক্রিয় সেশন
+        active_sessions_count = len(active_sessions) // 2
+        
+        # সর্বোচ্চ বার্তা প্রেরক
+        cursor.execute('''SELECT first_name, total_messages FROM users 
+                        ORDER BY total_messages DESC LIMIT 5''')
+        top_senders = cursor.fetchall()
+        
+        conn.close()
+    
+    # পরিসংখ্যান বার্তা
+    stats_msg = f"""
+📊 *বিস্তারিত পরিসংখ্যান*
+
+👥 *ব্যবহারকারী:*
+• মোট: {total_users}
+• সক্রিয়: {active_users}
+• নিষ্ক্রিয়: {total_users - active_users}
+
+📂 *গ্রুপ:*
+• মোট: {total_groups}
+• সক্রিয়: {len([g for g in get_all_groups() if get_group_info(g)['bot_status']])}
+
+💬 *বার্তা:*
+• আজ: {today_messages}
+• গড়: {today_messages // 24 if today_messages > 0 else 0}/ঘন্টা
+
+💭 *সেশন:*
+• সক্রিয়: {active_sessions_count}
+
+🏆 *শীর্ষ বার্তা প্রেরক:*
+"""
+    
+    for i, (name, count) in enumerate(top_senders, 1):
+        stats_msg += f"{i}. {name}: {count} বার্তা\n"
+    
+    bot.edit_message_text(stats_msg, chat_id, message_id, parse_mode="Markdown",
+                         reply_markup=admin_dashboard_keyboard())
+
+def accept_chat_request(call, target_user):
+    """চ্যাট রিকোয়েস্ট গ্রহণ"""
+    user_id = call.from_user.id
+    
+    # সেশন শুরু
+    session_id = start_chat_session(user_id, target_user)
+    
+    if session_id:
+        # রিকোয়েস্ট স্ট্যাটাস আপডেট
+        if target_user in chat_requests:
+            chat_requests[target_user]["status"] = "accepted"
+        
+        # এডমিনকে নোটিফাই
+        bot.edit_message_text(f"✅ আপনি এখন {target_user} আইডির ব্যবহারকারীর সাথে চ্যাট করছেন।",
+                            call.message.chat.id, call.message.message_id)
+        
+        # ব্যবহারকারীকে নোটিফাই
+        try:
+            welcome_msg = f"""
+🎉 আপনার অনুরোধ গ্রহণ করা হয়েছে!
+
+🤖 এখন আপনি একজন এডমিনের সাথে সরাসরি চ্যাট করতে পারবেন।
+
+💬 *নির্দেশনা:*
+• সরাসরি বার্তা লিখুন
+• ফাইল শেয়ার করতে পারেন
+• প্রয়োজন শেষে "চ্যাট শেষ করুন" বাটন ক্লিক করুন
+
+📞 সহায়তার জন্য: @YourSupport
+"""
+            bot.send_message(target_user, welcome_msg, parse_mode="Markdown",
+                           reply_markup=session_control_keyboard())
+            
+            # ব্যবহারকারীর কীবোর্ড আপডেট
+            bot.send_message(target_user, "💬 এখন চ্যাট শুরু করুন...",
+                           reply_markup=main_menu_keyboard(target_user))
+        except:
+            bot.send_message(user_id, "⚠️ ব্যবহারকারীকে নোটিফিকেশন পাঠানো যায়নি।")
+        
+        # কীবোর্ড আপডেট (সেশন শেষ বাটন যোগ)
+        markup = admin_dashboard_keyboard()
+        if user_id in active_sessions:
+            markup.add(types.InlineKeyboardButton("🔴 সেশন শেষ করুন", callback_data="end_session"))
+        
+        bot.send_message(user_id, "💬 চ্যাট সেশন শুরু হয়েছে! বার্তা লিখুন...",
+                       reply_markup=markup)
+    else:
+        bot.answer_callback_query(call.id, "❌ সেশন শুরু করতে সমস্যা হয়েছে।")
+
+def reject_chat_request(call, target_user):
+    """চ্যাট রিকোয়েস্ট প্রত্যাখ্যান"""
+    # রিকোয়েস্ট স্ট্যাটাস আপডেট
+    if target_user in chat_requests:
+        chat_requests[target_user]["status"] = "rejected"
+    
+    # এডমিনকে নোটিফাই
+    bot.edit_message_text(f"❌ আপনি {target_user} আইডির ব্যবহারকারীর অনুরোধ প্রত্যাখ্যান করেছেন।",
+                        call.message.chat.id, call.message.message_id)
+    
+    # ব্যবহারকারীকে নোটিফাই
+    try:
+        bot.send_message(target_user, "⚠️ আপনার সাহায্য অনুরোধ প্রত্যাখ্যান করা হয়েছে।")
+    except:
+        pass
+
+def end_session_callback(call):
+    """সেশন শেষ কলব্যাক"""
+    user_id = call.from_user.id
+    
+    if user_id in active_sessions:
+        partner_id = end_chat_session(user_id)
+        
+        if partner_id:
+            # উভয়কে নোটিফাই
+            bot.edit_message_text("✅ চ্যাট সেশন সফলভাবে শেষ হয়েছে।",
+                                call.message.chat.id, call.message.message_id)
+            
+            try:
+                bot.send_message(partner_id, "ℹ️ এডমিন চ্যাট সেশন শেষ করেছেন।")
+            except:
+                pass
+            
+            # কীবোর্ড রিফ্রেশ
+            bot.send_message(user_id, "🏠 প্রধান মেনু",
+                           reply_markup=admin_dashboard_keyboard())
+        else:
+            bot.answer_callback_query(call.id, "❌ সেশন শেষ করতে সমস্যা হয়েছে।")
+    else:
+        bot.answer_callback_query(call.id, "ℹ️ আপনার কোনো সক্রিয় সেশন নেই।")
+
+def toggle_group_setting(call, group_id, setting):
+    """গ্রুপ সেটিং টগল"""
+    group = get_group_info(group_id)
+    if not group:
+        bot.answer_callback_query(call.id, "❌ গ্রুপ খুঁজে পাওয়া যায়নি।")
+        return
+    
+    # বর্তমান মান
+    current_value = group[setting]
+    new_value = not current_value
+    
+    # আপডেট
+    update_group_setting(group_id, setting, int(new_value))
+    
+    # নোটিফাই
+    setting_names = {
+        "link_filter": "লিংক ফিল্টার",
+        "maintenance_mode": "মেইনটেনেন্স মোড",
+        "bot_status": "বট স্ট্যাটাস"
+    }
+    
+    status = "সক্রিয়" if new_value else "নিষ্ক্রিয়"
+    bot.answer_callback_query(call.id, f"✅ {setting_names[setting]} {status} করা হয়েছে।")
+    
+    # কীবোর্ড রিফ্রেশ
+    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id,
+                                reply_markup=group_settings_keyboard(group_id))
+
+def list_all_groups(call):
+    """সকল গ্রুপ তালিকা"""
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT chat_id, title FROM groups ORDER BY title')
+        groups = cursor.fetchall()
+        conn.close()
+    
+    if not groups:
+        bot.edit_message_text("📭 কোনো গ্রুপ পাওয়া যায়নি।",
+                            call.message.chat.id, call.message.message_id)
+        return
+    
+    markup = types.InlineKeyboardMarkup()
+    for chat_id, title in groups:
+        markup.add(types.InlineKeyboardButton(f"📍 {title[:30]}", 
+                                             callback_data=f"manage_group_{chat_id}"))
+    
+    markup.add(types.InlineKeyboardButton("⬅️ পিছনে", callback_data="group_settings"))
+    
+    bot.edit_message_text(f"📂 *গ্রুপ তালিকা ({len(groups)})*",
+                         call.message.chat.id, call.message.message_id,
+                         parse_mode="Markdown", reply_markup=markup)
+
+def leave_group_confirmation(call, group_id):
+    """গ্রুপ ছাড়ার কনফার্মেশন"""
+    group = get_group_info(group_id)
+    if not group:
+        bot.answer_callback_query(call.id, "❌ গ্রুপ খুঁজে পাওয়া যায়নি।")
+        return
+    
+    confirm_msg = f"""
+🚪 *গ্রুপ ছাড়ার নিশ্চয়তা*
+
+📛 গ্রুপ: {group['title']}
+🆔 আইডি: `{group_id}`
+
+⚠️ *সতর্কতা:*
+• লিভ মেসেজ পাঠানো হবে
+• গ্রুপ থেকে সরানো হবে
+• ডাটাবেস থেকে মুছে যাবে
+
+✅ আপনি কি নিশ্চিত?
+"""
+    
+    bot.edit_message_text(confirm_msg, call.message.chat.id, call.message.message_id,
+                         parse_mode="Markdown", reply_markup=confirm_keyboard("leave", group_id))
+
+def start_broadcast_to_all_groups(call):
+    """সকল গ্রুপে ব্রডকাস্ট শুরু"""
+    msg = bot.send_message(call.message.chat.id, "📝 *ব্রডকাস্ট বার্তা লিখুন:*", parse_mode="Markdown")
+    bot.register_next_step_handler(msg, process_broadcast_to_groups)
+
+def start_broadcast_to_all_users(call):
+    """সকল ব্যবহারকারীকে ব্রডকাস্ট শুরু"""
+    msg = bot.send_message(call.message.chat.id, "📝 *ব্যবহারকারীদের জন্য বার্তা লিখুন:*", parse_mode="Markdown")
+    bot.register_next_step_handler(msg, process_broadcast_to_users)
+
+def handle_confirmation(call, data):
+    """কনফার্মেশন হ্যান্ডল"""
+    parts = data.split('_')
+    action = parts[1]
+    target_id = int(parts[2])
+    
+    if action == "leave":
+        # গ্রুপ ছাড়ুন
+        try:
+            group = get_group_info(target_id)
+            leave_msg = group["leave_message"] if group else "Goodbye! 👋"
+            
+            # লিভ মেসেজ পাঠান
+            bot.send_message(target_id, leave_msg)
+            
+            # গ্রুপ ছাড়ুন
             bot.leave_chat(target_id)
             
-            # Remove from database
+            # ডাটাবেস থেকে মুছুন
             with db_lock:
                 conn = get_db_connection()
                 cursor = conn.cursor()
@@ -562,318 +1221,225 @@ def callback_logic(call):
                 conn.commit()
                 conn.close()
             
-            bot.edit_message_text(f"✅ Successfully left group `{target_id}`", chat_id, message_id, parse_mode="Markdown")
+            bot.edit_message_text(f"✅ গ্রুপ `{target_id}` থেকে সফলভাবে বেরিয়ে এসেছেন।",
+                                call.message.chat.id, call.message.message_id,
+                                parse_mode="Markdown")
+        
         except Exception as e:
-            bot.answer_callback_query(call.id, f"Failed to leave group: {str(e)}", show_alert=True)
-    
-    elif call.data == "set_leave_msg":
-        if not is_admin(user_id) or user_id != SUPER_ADMIN:
-            bot.answer_callback_query(call.id, "Only Super Admin can set leave message.", show_alert=True)
+            bot.edit_message_text(f"❌ ত্রুটি: {str(e)}",
+                                call.message.chat.id, call.message.message_id)
+
+def process_add_admin(message):
+    """এডমিন যোগ প্রক্রিয়া"""
+    try:
+        new_admin_id = int(message.text)
+        
+        # নিজেকে এডমিন করতে চাইলে
+        if new_admin_id == message.from_user.id:
+            bot.send_message(message.chat.id, "⚠️ আপনি ইতিমধ্যেই এডমিন!")
             return
         
-        msg = bot.send_message(chat_id, "✍️ Please send the leave message (emojis allowed):")
-        bot.register_next_step_handler(msg, process_set_leave_msg)
-    
-    elif call.data == "bc_all":
-        if not is_admin(user_id) or user_id != SUPER_ADMIN:
-            bot.answer_callback_query(call.id, "Only Super Admin can broadcast globally.", show_alert=True)
-            return
-        
-        msg = bot.send_message(chat_id, "📢 Send message for global broadcast:")
-        bot.register_next_step_handler(msg, process_global_broadcast)
-    
-    elif call.data.startswith("bc_"):
-        if not is_admin(user_id):
-            return
-        
-        target_id = int(call.data.split("_")[1])
-        if not is_admin(user_id, target_id):
-            bot.answer_callback_query(call.id, "Permission denied.", show_alert=True)
-            return
-        
-        msg = bot.send_message(chat_id, f"📢 Send message for group broadcast:")
-        bot.register_next_step_handler(msg, process_group_broadcast, target_id)
-    
-    elif call.data == "inbox_list":
-        if not is_admin(user_id):
-            return
-        
-        with db_lock:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT user_id, username, first_name, last_seen FROM users ORDER BY last_seen DESC LIMIT 30')
-            users = cursor.fetchall()
-            conn.close()
-        
-        if not users:
-            bot.edit_message_text("📭 No users found.", chat_id, message_id)
-            return
-        
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        for u in users:
-            user_id_db, username, first_name, last_seen = u
-            display_name = username if username else first_name if first_name else f"User {user_id_db}"
-            button_text = f"👤 {display_name[:15]}"
-            markup.add(types.InlineKeyboardButton(button_text, callback_data=f"view_user_{user_id_db}"))
-        
-        markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
-        bot.edit_message_text("📥 **Recent Users:** (Last 30)", chat_id, message_id, reply_markup=markup)
-    
-    elif call.data.startswith("view_user_"):
-        if not is_admin(user_id):
-            return
-        
-        target_user_id = int(call.data.split("_")[2])
-        user_info = get_user_info(target_user_id)
-        
+        # ব্যবহারকারী আছে কিনা চেক
+        user_info = get_user_info(new_admin_id)
         if not user_info:
-            bot.answer_callback_query(call.id, "User not found.", show_alert=True)
+            bot.send_message(message.chat.id, "❌ ব্যবহারকারী খুঁজে পাওয়া যায়নি!")
             return
         
-        user_text = f"👤 **User Information**\n\n"
-        user_text += f"🆔 ID: `{target_user_id}`\n"
-        user_text += f"📛 Name: {user_info['first_name']}\n"
-        user_text += f"📱 Username: @{user_info['username']}\n"
-        user_text += f"⏰ Last Seen: {user_info['last_seen']}\n"
-        user_text += f"📞 Total Requests: {user_info['chat_requests']}\n"
-        user_text += f"🚫 Status: {'Banned' if user_info['is_banned'] else 'Active'}"
+        # এডমিন যোগ
+        add_admin(new_admin_id, message.from_user.id)
         
-        bot.edit_message_text(user_text, chat_id, message_id, 
-                            reply_markup=user_menu_keyboard(target_user_id), parse_mode="Markdown")
-    
-    elif call.data.startswith("toggle_ban_"):
-        if not is_admin(user_id):
-            return
+        # নোটিফাই
+        success_msg = f"""
+✅ *নতুন এডমিন যোগ করা হয়েছে!*
+
+👤 নাম: {user_info['first_name']}
+🆔 আইডি: `{new_admin_id}`
+📱 ইউজারনেম: @{user_info['username']}
+👥 যোগ করেছেন: {message.from_user.first_name}
+
+🔔 ব্যবহারকারীকে নোটিফিকেশন পাঠানো হয়েছে।
+"""
+        bot.send_message(message.chat.id, success_msg, parse_mode="Markdown")
         
-        target_user_id = int(call.data.split("_")[2])
-        new_status = toggle_ban_user(target_user_id)
-        
-        if new_status is not None:
-            status_text = "banned" if new_status == 1 else "unbanned"
-            bot.answer_callback_query(call.id, f"User {status_text} successfully.")
-            
-            # Update the message
-            user_info = get_user_info(target_user_id)
-            user_text = f"👤 **User Information**\n\n"
-            user_text += f"🆔 ID: `{target_user_id}`\n"
-            user_text += f"📛 Name: {user_info['first_name']}\n"
-            user_text += f"📱 Username: @{user_info['username']}\n"
-            user_text += f"⏰ Last Seen: {user_info['last_seen']}\n"
-            user_text += f"📞 Total Requests: {user_info['chat_requests']}\n"
-            user_text += f"🚫 Status: {'Banned' if user_info['is_banned'] else 'Active'}"
-            
-            bot.edit_message_text(user_text, chat_id, message_id, 
-                                reply_markup=user_menu_keyboard(target_user_id), parse_mode="Markdown")
-    
-    elif call.data.startswith("start_chat_"):
-        if not is_admin(user_id):
-            return
-        
-        target_user_id = int(call.data.split("_")[2])
-        
-        # Start session
-        active_sessions[user_id] = target_user_id
-        active_sessions[target_user_id] = user_id
-        
-        # Notify admin
-        bot.edit_message_text(f"💬 **Chat session started**\n\nYou are now chatting with user `{target_user_id}`.\n\nSend messages normally to communicate.", 
-                            chat_id, message_id, parse_mode="Markdown")
-        
-        # Notify user
+        # নতুন এডমিনকে নোটিফাই
         try:
-            bot.send_message(target_user_id, "💬 An admin has started a chat session with you. You can now chat directly.")
+            bot.send_message(new_admin_id, f"""
+🎉 আপনি এখন একজন এডমিন!
+
+🤖 *এডমিন সুবিধা সমূহ:*
+• গ্রুপ ম্যানেজমেন্ট
+• ব্যবহারকারী ব্যবস্থাপনা
+• ব্রডকাস্ট সিস্টেম
+• চ্যাট সেশন
+
+📊 ড্যাশবোর্ড দেখতে: /menu
+            """)
         except:
             pass
     
-    elif call.data.startswith("send_msg_"):
-        if not is_admin(user_id):
-            return
-        
-        target_user_id = int(call.data.split("_")[2])
-        msg = bot.send_message(chat_id, f"✍️ Send a message to user `{target_user_id}`:")
-        bot.register_next_step_handler(msg, process_send_message, target_user_id)
-    
-    elif call.data == "add_admin":
-        if not is_admin(user_id) or user_id != SUPER_ADMIN:
-            bot.answer_callback_query(call.id, "Only Super Admin can add admins.", show_alert=True)
-            return
-        
-        msg = bot.send_message(chat_id, "🆔 Send User ID to add as admin:")
-        bot.register_next_step_handler(msg, process_add_admin_step1)
-    
-    elif call.data == "admin_list":
-        if not is_admin(user_id):
-            return
-        
-        with db_lock:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT user_id, target_group FROM admins')
-            admins = cursor.fetchall()
-            conn.close()
-        
-        admin_text = "📋 **Admin List:**\n\n"
-        for admin in admins:
-            admin_id, target_group = admin
-            admin_text += f"• `{admin_id}` - Group: `{target_group if target_group != 0 else 'All'}`\n"
-        
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
-        bot.edit_message_text(admin_text, chat_id, message_id, reply_markup=markup, parse_mode="Markdown")
-    
-    elif call.data == "del_admin_list":
-        if not is_admin(user_id) or user_id != SUPER_ADMIN:
-            bot.answer_callback_query(call.id, "Only Super Admin can remove admins.", show_alert=True)
-            return
-        
-        with db_lock:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT user_id FROM admins WHERE user_id != ?', (SUPER_ADMIN,))
-            admins = cursor.fetchall()
-            conn.close()
-        
-        if not admins:
-            bot.edit_message_text("📭 No admins to remove.", chat_id, message_id)
-            return
-        
-        markup = types.InlineKeyboardMarkup()
-        for admin in admins:
-            markup.add(types.InlineKeyboardButton(f"Remove Admin {admin[0]}", callback_data=f"rm_adm_{admin[0]}"))
-        markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
-        
-        bot.edit_message_text("🗑 **Select Admin to Remove:**", chat_id, message_id, reply_markup=markup)
-    
-    elif call.data.startswith("rm_adm_"):
-        if not is_admin(user_id) or user_id != SUPER_ADMIN:
-            return
-        
-        admin_id = int(call.data.split("_")[2])
-        
-        with db_lock:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM admins WHERE user_id = ?', (admin_id,))
-            conn.commit()
-            conn.close()
-        
-        bot.edit_message_text(f"✅ Admin `{admin_id}` removed successfully.", 
-                            chat_id, message_id, reply_markup=main_admin_keyboard(user_id), parse_mode="Markdown")
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ অবৈধ আইডি! শুধুমাত্র সংখ্যা দিন।")
 
-# ================= NEXT STEP HANDLERS =================
-def process_set_leave_msg(message):
-    try:
-        new_msg = message.text
-        if not new_msg or len(new_msg) > 1000:
-            bot.send_message(message.chat.id, "❌ Please send a valid message (max 1000 characters).")
-            return
-        
-        # Update global leave message by updating all groups
-        with db_lock:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('UPDATE groups SET leave_msg = ?', (new_msg,))
-            conn.commit()
-            conn.close()
-        
-        bot.send_message(message.chat.id, f"✅ Leave message updated globally:\n\n`{new_msg}`", parse_mode="Markdown")
-    except Exception as e:
-        bot.send_message(message.chat.id, f"❌ Error: {str(e)}")
-
-def process_add_admin_step1(message):
-    try:
-        new_id = int(message.text)
-        msg = bot.send_message(message.chat.id, "📍 Send Group ID for this admin (send `0` for all groups):")
-        bot.register_next_step_handler(msg, process_add_admin_step2, new_id)
-    except:
-        bot.send_message(message.chat.id, "❌ Invalid User ID.")
-
-def process_add_admin_step2(message, new_id):
-    try:
-        target_gid = int(message.text)
-        with db_lock:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('INSERT OR REPLACE INTO admins (user_id, target_group) VALUES (?, ?)', 
-                         (new_id, target_gid))
-            conn.commit()
-            conn.close()
-        
-        scope = "all groups" if target_gid == 0 else f"group {target_gid}"
-        bot.send_message(message.chat.id, f"✅ Admin `{new_id}` added successfully for {scope}.")
-    except:
-        bot.send_message(message.chat.id, "❌ Invalid Group ID.")
-
-def process_group_broadcast(message, target_id):
-    try:
-        if message.text:
-            bot.send_message(target_id, message.text, parse_mode="Markdown")
-        elif message.photo:
-            bot.send_photo(target_id, message.photo[-1].file_id, caption=message.caption)
-        elif message.video:
-            bot.send_video(target_id, message.video.file_id, caption=message.caption)
-        elif message.document:
-            bot.send_document(target_id, message.document.file_id, caption=message.caption)
-        
-        bot.send_message(message.chat.id, "✅ Broadcast sent successfully!")
-    except Exception as e:
-        bot.send_message(message.chat.id, f"❌ Failed to send broadcast: {str(e)}")
-
-def process_global_broadcast(message):
+def show_admin_list_for_removal(call):
+    """এডমিন অপসারণ তালিকা"""
     with db_lock:
         conn = get_db_connection()
         cursor = conn.cursor()
-        groups = cursor.execute('SELECT chat_id FROM groups').fetchall()
+        cursor.execute('''SELECT a.user_id, u.first_name, u.username 
+                        FROM admins a 
+                        LEFT JOIN users u ON a.user_id = u.user_id 
+                        WHERE a.user_id != ?''', (SUPER_ADMIN,))
+        admins = cursor.fetchall()
         conn.close()
     
+    if not admins:
+        bot.edit_message_text("📭 কোনো এডমিন পাওয়া যায়নি।",
+                            call.message.chat.id, call.message.message_id)
+        return
+    
+    markup = types.InlineKeyboardMarkup()
+    for admin_id, name, username in admins:
+        display_name = f"{name} (@{username})" if username else name
+        markup.add(types.InlineKeyboardButton(f"➖ {display_name[:30]}", 
+                                             callback_data=f"remove_admin_{admin_id}"))
+    
+    markup.add(types.InlineKeyboardButton("⬅️ পিছনে", callback_data="back_to_dashboard"))
+    
+    bot.edit_message_text(f"🗑 *এডমিন অপসারণ ({len(admins)})*",
+                         call.message.chat.id, call.message.message_id,
+                         parse_mode="Markdown", reply_markup=markup)
+
+def process_broadcast_to_groups(message):
+    """গ্রুপে ব্রডকাস্ট প্রক্রিয়া"""
+    user_id = message.from_user.id
+    broadcast_text = message.text
+    
+    if not broadcast_text or len(broadcast_text) < 5:
+        bot.send_message(message.chat.id, "❌ বার্তাটি খুব ছোট! অন্তত ৫ অক্ষর লিখুন।")
+        return
+    
+    # গ্রুপ তালিকা পান
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT chat_id, title FROM groups WHERE bot_status = 1')
+        groups = cursor.fetchall()
+        conn.close()
+    
+    if not groups:
+        bot.send_message(message.chat.id, "❌ কোনো সক্রিয় গ্রুপ পাওয়া যায়নি।")
+        return
+    
+    # ব্রডকাস্ট শুরু
+    total = len(groups)
     success = 0
     failed = 0
     
-    for group in groups:
+    bot.send_message(message.chat.id, f"📤 {total}টি গ্রুপে ব্রডকাস্ট শুরু হচ্ছে...")
+    
+    for chat_id, title in groups:
         try:
-            if message.text:
-                bot.send_message(group[0], message.text, parse_mode="Markdown")
-            elif message.photo:
-                bot.send_photo(group[0], message.photo[-1].file_id, caption=message.caption)
-            elif message.video:
-                bot.send_video(group[0], message.video.file_id, caption=message.caption)
-            elif message.document:
-                bot.send_document(group[0], message.document.file_id, caption=message.caption)
+            bot.send_message(chat_id, broadcast_text)
             success += 1
         except:
             failed += 1
     
-    bot.send_message(message.chat.id, 
-                   f"📊 **Broadcast Results:**\n✅ Success: {success}\n❌ Failed: {failed}")
+    # রিপোর্ট
+    report_msg = f"""
+📊 *ব্রডকাস্ট রিপোর্ট*
 
-def process_send_message(message, target_user_id):
-    try:
-        if message.text:
-            bot.send_message(target_user_id, f"📨 **Message from Admin:**\n\n{message.text}")
-            bot.send_message(message.chat.id, f"✅ Message sent to user `{target_user_id}`", parse_mode="Markdown")
-        elif message.photo:
-            bot.send_photo(target_user_id, message.photo[-1].file_id, 
-                         caption=f"📨 Message from Admin:\n\n{message.caption}")
-            bot.send_message(message.chat.id, f"✅ Photo sent to user `{target_user_id}`", parse_mode="Markdown")
-        elif message.video:
-            bot.send_video(target_user_id, message.video.file_id, 
-                         caption=f"📨 Message from Admin:\n\n{message.caption}")
-            bot.send_message(message.chat.id, f"✅ Video sent to user `{target_user_id}`", parse_mode="Markdown")
-        elif message.document:
-            bot.send_document(target_user_id, message.document.file_id, 
-                            caption=f"📨 Message from Admin:\n\n{message.caption}")
-            bot.send_message(message.chat.id, f"✅ Document sent to user `{target_user_id}`", parse_mode="Markdown")
-    except Exception as e:
-        bot.send_message(message.chat.id, f"❌ Failed to send message: {str(e)}")
+✅ সফল: {success}
+❌ ব্যর্থ: {failed}
+📋 মোট: {total}
 
-# ================= RUN BOT =================
-if __name__ == "__main__":
-    threading.Thread(target=run_web_server, daemon=True).start()
-    print("🤖 Bot is starting...")
+⏰ সময়: {datetime.datetime.now().strftime("%H:%M:%S")}
+"""
+    bot.send_message(message.chat.id, report_msg, parse_mode="Markdown")
+
+def process_broadcast_to_users(message):
+    """ব্যবহারকারীদের ব্রডকাস্ট প্রক্রিয়া"""
+    user_id = message.from_user.id
+    broadcast_text = message.text
     
+    if not broadcast_text or len(broadcast_text) < 5:
+        bot.send_message(message.chat.id, "❌ বার্তাটি খুব ছোট! অন্তত ৫ অক্ষর লিখুন।")
+        return
+    
+    # ব্যবহারকারী তালিকা পান
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id FROM users WHERE is_banned = 0')
+        users = cursor.fetchall()
+        conn.close()
+    
+    if not users:
+        bot.send_message(message.chat.id, "❌ কোনো ব্যবহারকারী পাওয়া যায়নি।")
+        return
+    
+    # ব্রডকাস্ট শুরু
+    total = len(users)
+    success = 0
+    failed = 0
+    
+    bot.send_message(message.chat.id, f"📤 {total}জন ব্যবহারকারীকে ব্রডকাস্ট শুরু হচ্ছে...")
+    
+    for user_row in users:
+        user_id_target = user_row[0]
+        try:
+            bot.send_message(user_id_target, broadcast_text)
+            success += 1
+        except:
+            failed += 1
+    
+    # রিপোর্ট
+    report_msg = f"""
+📊 *ব্যবহারকারী ব্রডকাস্ট রিপোর্ট*
+
+✅ সফল: {success}
+❌ ব্যর্থ: {failed}
+📋 মোট: {total}
+
+⏰ সময়: {datetime.datetime.now().strftime("%H:%M:%S")}
+"""
+    bot.send_message(message.chat.id, report_msg, parse_mode="Markdown")
+
+def get_all_groups():
+    """সকল গ্রুপ আইডি পান"""
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT chat_id FROM groups')
+        groups = [row[0] for row in cursor.fetchall()]
+        conn.close()
+    return groups
+
+# ================= START BOT =================
+if __name__ == "__main__":
+    print("""
+    🤖 *Telegram Bot Starting...*
+    
+    🔧 Features Included:
+    1. ✅ User Management System
+    2. ✅ Group Management System
+    3. ✅ Chat Session System
+    4. ✅ Broadcast System
+    5. ✅ Admin Panel
+    6. ✅ Settings Management
+    7. ✅ Statistics & Logs
+    8. ✅ Full Control System
+    
+    🌐 Web Server: http://localhost:10000
+    🚀 Bot Status: Running...
+    """)
+    
+    # Flask ওয়েব সার্ভার শুরু করুন
+    threading.Thread(target=run_web_server, daemon=True).start()
+    
+    # বট পোলিং শুরু করুন
     while True:
         try:
             bot.polling(none_stop=True, interval=0, timeout=60)
         except Exception as e:
-            print(f"⚠️ Polling error: {e}")
+            print(f"⚠️ Error: {e}")
             time.sleep(5)
