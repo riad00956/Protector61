@@ -131,7 +131,7 @@ def handle_all(message):
         return
 
     if message.text == "/admin" and is_admin(uid):
-        bot.send_message(cid, "🏮 **Nio Server Xq - Admin Panel**", 
+        bot.send_message(cid, "🏮 Trigger,👉 @xq_trigger_bot - Admin Panel", 
                          parse_mode="Markdown", reply_markup=main_admin_keyboard())
         return
 
