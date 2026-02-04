@@ -207,13 +207,13 @@ def callback_logic(call):
 
     if call.data == "req_chat":
         now = time.time()
-        if uid in cooldowns and now - cooldowns[uid] < 600: # 10 mins (600s)
+        if uid in cooldowns and now - cooldowns[uid] < 600: 
             bot.answer_callback_query(call.id, "Please wait 10 mins before next request.", show_alert=True)
             return
         cooldowns[uid] = now
-        bot.edit_message_text("✅ Your request has been sent to admins.", cid, mid)
+        bot.edit_message_text("✅ Your request has been sent to moderator.", cid, mid)
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("✅ Accept Chat", callback_data=f"start_sess_{uid}"))
+        markup.add(types.InlineKeyboardButton("✅ Your request has been accepted by a moderator.", callback_data=f"start_sess_{uid}"))
         bot.send_message(SUPER_ADMIN, f"🙋 **Chat Request!**\nName: {call.from_user.first_name}\nID: `{uid}`", reply_markup=markup, parse_mode="Markdown")
         return
 
@@ -251,6 +251,8 @@ def callback_logic(call):
         if uid != SUPER_ADMIN:
             bot.answer_callback_query(call.id, "Only Super Admin can do this.", show_alert=True)
             return
+        
+        # এখানে ডাটাবেস থেকে আপনার সেট করা মেসেজটি নেওয়া হচ্ছে
         msg = get_setting(target_id, 'leave_msg')
         try:
             bot.send_message(target_id, msg)
@@ -260,7 +262,7 @@ def callback_logic(call):
             bot.answer_callback_query(call.id, "Failed to leave group.")
 
     elif call.data == "set_leave_msg":
-        msg = bot.send_message(cid, "✍️ Send the message you want the bot to say before leaving:")
+        msg = bot.send_message(cid, "✍️ Send the message you want the bot to say before leaving (Emoji allowed):")
         bot.register_next_step_handler(msg, process_set_leave_msg)
 
     elif call.data == "bc_all":
@@ -310,14 +312,29 @@ def callback_logic(call):
 def process_set_leave_msg(message):
     try:
         new_msg = message.text
+        if not new_msg:
+            bot.send_message(message.chat.id, "❌ Please send a valid text message.")
+            return
+
         with db_lock:
             conn = get_db_connection()
-            # Update for all or default (simple way)
-            conn.cursor().execute('UPDATE settings SET leave_msg = ?', (new_msg,))
+            # এখানে 'settings' টেবিলের 'leave_msg' কলামটি আপডেট করা হচ্ছে
+            # এটি সব গ্রুপের জন্য গ্লোবাল মেসেজ হিসেবে কাজ করবে
+            cursor = conn.cursor()
+            # চেক করা হচ্ছে কোনো সেটিংস আছে কি না, না থাকলে ইনসার্ট করবে
+            cursor.execute('SELECT chat_id FROM settings LIMIT 1')
+            row = cursor.fetchone()
+            if row:
+                cursor.execute('UPDATE settings SET leave_msg = ?', (new_msg,))
+            else:
+                # যদি টেবিল একদম খালি থাকে (নতুন বট হলে)
+                cursor.execute('INSERT INTO settings (chat_id, leave_msg) VALUES (0, ?)', (new_msg,))
+            
             conn.commit()
             conn.close()
-        bot.send_message(message.chat.id, "✅ Leave message updated!")
-    except: bot.send_message(message.chat.id, "❌ Error.")
+        bot.send_message(message.chat.id, f"✅ Leave message updated to:\n`{new_msg}`", parse_mode="Markdown")
+    except Exception as e: 
+        bot.send_message(message.chat.id, f"❌ Error: {str(e)}")
 
 def process_add_admin_step1(message):
     try:
@@ -359,3 +376,4 @@ if __name__ == "__main__":
     while True:
         try: bot.polling(none_stop=True, interval=0, timeout=60)
         except: time.sleep(5)
+            
