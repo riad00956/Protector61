@@ -1,1243 +1,748 @@
-import os
+import telebot
 import sqlite3
+import io
+import datetime
+import requests
+import json
 import threading
 import time
-import logging
-import json
-from datetime import datetime, timedelta
-from flask import Flask, request
-import telebot
 from telebot import types
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-import re
+from flask import Flask
 
-# Initialize Flask app
-app = Flask(__name__)
-
-# Bot Token এবং Admin ID
-BOT_TOKEN = '8000160699:AAHq1VLvd05PFxFVibuErFx4E6Uf7y6F8HE'
-bot = telebot.TeleBot(BOT_TOKEN)
-
-# Super Admin ID
-SUPER_ADMIN_ID = 7832264582
-
-# Database setup
-DB_NAME = 'bot_final.db'
-
-# Store active sessions, cooldowns, এবং message states
-active_sessions = {}
-user_cooldowns = {}
-user_message_states = {}
-admin_panel_messages = {}
-
-# Setup logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# ================ DATABASE FUNCTIONS ================
-
-def init_db():
-    """Initialize database with all required tables"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    # Users table
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        last_name TEXT,
-        is_banned INTEGER DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        message_count INTEGER DEFAULT 0,
-        last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    ''')
-    
-    # Groups table
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS groups (
-        group_id INTEGER PRIMARY KEY,
-        title TEXT,
-        maintenance_mode INTEGER DEFAULT 0,
-        link_filter INTEGER DEFAULT 1,
-        bot_active INTEGER DEFAULT 1,
-        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    ''')
-    
-    # Admins table
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS admins (
-        admin_id INTEGER PRIMARY KEY,
-        username TEXT,
-        is_super INTEGER DEFAULT 0,
-        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    ''')
-    
-    # Settings table
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS settings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        setting_key TEXT UNIQUE,
-        setting_value TEXT
-    )
-    ''')
-    
-    # Add super admin if not exists
-    cursor.execute('INSERT OR IGNORE INTO admins (admin_id, username, is_super) VALUES (?, ?, ?)',
-                   (SUPER_ADMIN_ID, 'super_admin', 1))
-    
-    # Add default settings
-    cursor.execute('INSERT OR IGNORE INTO settings (setting_key, setting_value) VALUES (?, ?)',
-                   ('leave_message', '👋 Goodbye!'))
-    
-    conn.commit()
-    conn.close()
-
-def add_user(user_id, username, first_name=None, last_name=None):
-    """Add or update user in database"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR REPLACE INTO users (user_id, username, first_name, last_name, last_active)
-        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-    ''', (user_id, username, first_name, last_name))
-    conn.commit()
-    conn.close()
-
-def get_user(user_id):
-    """Get user details from database"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-    user = cursor.fetchone()
-    conn.close()
-    return user
-
-def get_all_users(page=0, limit=10):
-    """Get paginated registered users"""
-    offset = page * limit
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT user_id, username, first_name, message_count, last_active 
-        FROM users 
-        ORDER BY last_active DESC 
-        LIMIT ? OFFSET ?
-    ''', (limit, offset))
-    users = cursor.fetchall()
-    
-    cursor.execute('SELECT COUNT(*) FROM users')
-    total = cursor.fetchone()[0]
-    
-    conn.close()
-    return users, total
-
-def ban_user(user_id):
-    """Ban a user"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('UPDATE users SET is_banned = 1 WHERE user_id = ?', (user_id,))
-    conn.commit()
-    conn.close()
-
-def unban_user(user_id):
-    """Unban a user"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('UPDATE users SET is_banned = 0 WHERE user_id = ?', (user_id,))
-    conn.commit()
-    conn.close()
-
-def is_banned(user_id):
-    """Check if user is banned"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT is_banned FROM users WHERE user_id = ?', (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result and result[0] == 1
-
-def add_group(group_id, title):
-    """Add or update group in database"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR IGNORE INTO groups (group_id, title)
-        VALUES (?, ?)
-    ''', (group_id, title))
-    conn.commit()
-    conn.close()
-
-def get_all_groups(page=0, limit=10):
-    """Get paginated groups"""
-    offset = page * limit
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT group_id, title, maintenance_mode, link_filter, bot_active 
-        FROM groups 
-        ORDER BY added_at DESC 
-        LIMIT ? OFFSET ?
-    ''', (limit, offset))
-    groups = cursor.fetchall()
-    
-    cursor.execute('SELECT COUNT(*) FROM groups')
-    total = cursor.fetchone()[0]
-    
-    conn.close()
-    return groups, total
-
-def update_group_setting(group_id, setting, value):
-    """Update group setting"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    if setting in ['maintenance_mode', 'link_filter', 'bot_active']:
-        cursor.execute(f'UPDATE groups SET {setting} = ? WHERE group_id = ?', (value, group_id))
-    conn.commit()
-    conn.close()
-
-def get_group_settings(group_id):
-    """Get group settings"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT maintenance_mode, link_filter, bot_active FROM groups WHERE group_id = ?', (group_id,))
-    settings = cursor.fetchone()
-    conn.close()
-    return settings
-
-def add_admin(admin_id, username, is_super=0):
-    """Add an admin"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('INSERT OR IGNORE INTO admins (admin_id, username, is_super) VALUES (?, ?, ?)',
-                   (admin_id, username, is_super))
-    conn.commit()
-    conn.close()
-
-def get_admins():
-    """Get all admins"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT admin_id, username, is_super FROM admins')
-    admins = cursor.fetchall()
-    conn.close()
-    return admins
-
-def is_admin(user_id):
-    """Check if user is admin"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT admin_id FROM admins WHERE admin_id = ?', (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result is not None
-
-def is_super_admin(user_id):
-    """Check if user is super admin"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT admin_id FROM admins WHERE admin_id = ? AND is_super = 1', (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result is not None
-
-def get_setting(key):
-    """Get setting value"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT setting_value FROM settings WHERE setting_key = ?', (key,))
-    result = cursor.fetchone()
-    conn.close()
-    return result[0] if result else None
-
-def update_setting(key, value):
-    """Update setting"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('INSERT OR REPLACE INTO settings (setting_key, setting_value) VALUES (?, ?)',
-                   (key, value))
-    conn.commit()
-    conn.close()
-
-def add_session(user_id, admin_id):
-    """Add a new session"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO sessions (user_id, admin_id, status)
-        VALUES (?, ?, 'active')
-    ''', (user_id, admin_id))
-    session_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return session_id
-
-def pause_session(session_id):
-    """Pause a session"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('UPDATE sessions SET is_paused = 1 WHERE session_id = ?', (session_id,))
-    conn.commit()
-    conn.close()
-
-def resume_session(session_id):
-    """Resume a paused session"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('UPDATE sessions SET is_paused = 0 WHERE session_id = ?', (session_id,))
-    conn.commit()
-    conn.close()
-
-def end_session(session_id):
-    """End a session"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('UPDATE sessions SET status = "ended", ended_at = CURRENT_TIMESTAMP WHERE session_id = ?',
-                   (session_id,))
-    conn.commit()
-    conn.close()
-
-# ================ HELPER FUNCTIONS ================
-
-def create_pagination_keyboard(current_page, total_pages, callback_prefix, extra_buttons=None):
-    """Create pagination keyboard"""
-    keyboard = InlineKeyboardMarkup(row_width=5)
-    
-    page_buttons = []
-    start_page = max(1, current_page - 2)
-    end_page = min(total_pages, current_page + 2)
-    
-    for page in range(start_page, end_page + 1):
-        if page == current_page:
-            page_buttons.append(InlineKeyboardButton(f"•{page}•", callback_data=f"{callback_prefix}_page_{page}"))
-        else:
-            page_buttons.append(InlineKeyboardButton(str(page), callback_data=f"{callback_prefix}_page_{page}"))
-    
-    nav_buttons = []
-    if current_page > 1:
-        nav_buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"{callback_prefix}_page_{current_page-1}"))
-    
-    nav_buttons.append(InlineKeyboardButton("🏠 Home", callback_data="back_to_admin"))
-    
-    if current_page < total_pages:
-        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"{callback_prefix}_page_{current_page+1}"))
-    
-    if page_buttons:
-        keyboard.add(*page_buttons)
-    
-    if nav_buttons:
-        if len(nav_buttons) == 3:
-            keyboard.row(*nav_buttons)
-        else:
-            for btn in nav_buttons:
-                keyboard.add(btn)
-    
-    if extra_buttons:
-        for btn in extra_buttons:
-            keyboard.add(btn)
-    
-    return keyboard
-
-def update_admin_panel_message(chat_id, message_id, text, reply_markup=None):
-    """Update existing admin panel message"""
-    try:
-        bot.edit_message_text(
-            text,
-            chat_id,
-            message_id,
-            reply_markup=reply_markup,
-            parse_mode='HTML'
-        )
-        return message_id
-    except:
-        try:
-            bot.delete_message(chat_id, message_id)
-        except:
-            pass
-        new_msg = bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode='HTML')
-        return new_msg.message_id
-
-# ================ BOT HANDLERS ================
-
-@bot.message_handler(commands=['start'])
-def handle_start(message):
-    """Handle /start command"""
-    user_id = message.from_user.id
-    username = message.from_user.username
-    first_name = message.from_user.first_name
-    last_name = message.from_user.last_name
-    
-    if is_banned(user_id):
-        bot.send_message(user_id, "❌ You are banned from using this bot.")
-        return
-    
-    add_user(user_id, username, first_name, last_name)
-    
-    if message.chat.type == 'private':
-        if user_id in user_message_states:
-            del user_message_states[user_id]
-        
-        keyboard = InlineKeyboardMarkup()
-        keyboard.add(InlineKeyboardButton("🙋 Request Chat", callback_data="request_chat"))
-        
-        welcome_text = """
-👋 Welcome to the Support Bot!
-
-Click the button below to request a chat with an admin.
-
-⚠️ Note: You cannot message admins directly. All communication must go through the request system.
-        """
-        bot.send_message(user_id, welcome_text, reply_markup=keyboard)
-
-@bot.callback_query_handler(func=lambda call: call.data == 'request_chat')
-def handle_chat_request(call):
-    """Handle chat request from user"""
-    user_id = call.from_user.id
-    username = call.from_user.username or "No Username"
-    first_name = call.from_user.first_name or ""
-    
-    if user_id in user_cooldowns:
-        time_passed = time.time() - user_cooldowns[user_id]
-        if time_passed < 600:
-            remaining = int(600 - time_passed)
-            minutes = remaining // 60
-            seconds = remaining % 60
-            bot.answer_callback_query(call.id, 
-                                     f"⏳ Please wait {minutes}m {seconds}s before requesting again.", 
-                                     show_alert=True)
-            return
-    
-    if user_id in active_sessions:
-        bot.answer_callback_query(call.id, "You already have an active session!", show_alert=True)
-        return
-    
-    if is_banned(user_id):
-        bot.answer_callback_query(call.id, "❌ You are banned from using this bot.", show_alert=True)
-        return
-    
-    user_cooldowns[user_id] = time.time()
-    
-    admins = get_admins()
-    request_text = f"""
-📨 New Chat Request:
-
-👤 User: {first_name} (@{username})
-🆔 ID: {user_id}
-⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-    """
-    
-    for admin_id, admin_username, _ in admins:
-        keyboard = InlineKeyboardMarkup()
-        keyboard.row(
-            InlineKeyboardButton("✅ Accept", callback_data=f"accept_{user_id}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"reject_{user_id}")
-        )
-        try:
-            bot.send_message(admin_id, request_text, reply_markup=keyboard)
-        except:
-            pass
-    
-    bot.answer_callback_query(call.id, "✅ Your request has been sent to admins!")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('accept_'))
-def handle_accept_request(call):
-    """Handle accept request from admin"""
-    admin_id = call.from_user.id
-    
-    if not is_admin(admin_id):
-        bot.answer_callback_query(call.id, "❌ You are not authorized!", show_alert=True)
-        return
-    
-    user_id = int(call.data.split('_')[1])
-    
-    session_id = add_session(user_id, admin_id)
-    active_sessions[user_id] = {
-        'admin_id': admin_id,
-        'session_id': session_id,
-        'start_time': datetime.now(),
-        'is_paused': False
-    }
-    
-    try:
-        keyboard = InlineKeyboardMarkup()
-        keyboard.row(
-            InlineKeyboardButton("⏸️ Pause", callback_data=f"pause_session_{session_id}"),
-            InlineKeyboardButton("⏹️ End", callback_data=f"end_session_{session_id}")
-        )
-        bot.send_message(user_id, "✅ Your chat request has been accepted! You can now message the admin.", reply_markup=keyboard)
-    except:
-        pass
-    
-    user_info = get_user(user_id)
-    user_name = user_info[2] if user_info else "User"
-    
-    keyboard = InlineKeyboardMarkup()
-    keyboard.row(
-        InlineKeyboardButton("⏸️ Pause", callback_data=f"pause_session_{session_id}"),
-        InlineKeyboardButton("▶️ Resume", callback_data=f"resume_session_{session_id}")
-    )
-    keyboard.add(InlineKeyboardButton("⏹️ End Session", callback_data=f"end_session_{session_id}"))
-    
-    bot.answer_callback_query(call.id, f"✅ Chat started with {user_name}")
-    
-    try:
-        bot.edit_message_text(
-            f"✅ Chat session started with User ID: {user_id}\n\nUse buttons below to manage session:",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=keyboard
-        )
-    except:
-        pass
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('reject_'))
-def handle_reject_request(call):
-    """Handle reject request from admin"""
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "❌ You are not authorized!", show_alert=True)
-        return
-    
-    user_id = int(call.data.split('_')[1])
-    
-    try:
-        bot.send_message(user_id, "❌ Your chat request has been rejected by the admin.")
-    except:
-        pass
-    
-    bot.answer_callback_query(call.id, "❌ Request rejected")
-    
-    try:
-        bot.edit_message_text(f"❌ Chat request rejected for User ID: {user_id}",
-                              call.message.chat.id,
-                              call.message.message_id)
-    except:
-        pass
-
-@bot.message_handler(commands=['admin'])
-def handle_admin_panel(message):
-    """Handle /admin command"""
-    user_id = message.from_user.id
-    
-    if not is_admin(user_id):
-        bot.send_message(user_id, "❌ You are not authorized to access the admin panel.")
-        return
-    
-    if user_id in user_message_states:
-        del user_message_states[user_id]
-    
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    
-    if is_super_admin(user_id):
-        keyboard.add(
-            InlineKeyboardButton("📥 Inbox Manager", callback_data="inbox_manager_1"),
-            InlineKeyboardButton("📂 Group Manager", callback_data="group_manager_1"),
-            InlineKeyboardButton("👥 Add Admin", callback_data="add_admin_menu"),
-            InlineKeyboardButton("📢 Broadcast", callback_data="broadcast_menu"),
-            InlineKeyboardButton("⚙️ Settings", callback_data="settings_menu"),
-            InlineKeyboardButton("📊 Statistics", callback_data="statistics")
-        )
-    else:
-        keyboard.add(
-            InlineKeyboardButton("📥 Inbox", callback_data="inbox_manager_1"),
-            InlineKeyboardButton("📂 Groups", callback_data="group_manager_1"),
-            InlineKeyboardButton("📊 Statistics", callback_data="statistics")
-        )
-    
-    admin_text = f"""
-🛠️ <b>Admin Control Panel</b>
-
-👤 Admin: {message.from_user.first_name}
-🎯 Type: {'Super Admin' if is_super_admin(user_id) else 'Admin'}
-🕒 Time: {datetime.now().strftime('%I:%M %p')}
-
-Choose an option from below:
-    """
-    
-    bot.send_message(user_id, admin_text, reply_markup=keyboard, parse_mode='HTML')
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('inbox_manager_'))
-def show_inbox_manager(call):
-    """Show inbox manager with paginated users"""
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "❌ Unauthorized!", show_alert=True)
-        return
-    
-    page = int(call.data.split('_')[2]) if len(call.data.split('_')) > 2 else 1
-    users, total = get_all_users(page-1, 10)
-    
-    if not users:
-        text = "📭 <b>Inbox Manager</b>\n\nNo registered users yet."
-        keyboard = InlineKeyboardMarkup()
-        keyboard.add(InlineKeyboardButton("⬅️ Back", callback_data="back_to_admin"))
-        update_admin_panel_message(call.message.chat.id, call.message.message_id, text, keyboard)
-        return
-    
-    total_pages = (total + 9) // 10
-    
-    user_list = ""
-    for i, user in enumerate(users, start=1):
-        user_id, username, first_name, msg_count, last_active = user
-        username_display = f"@{username}" if username else "No Username"
-        name_display = first_name or "Unknown"
-        
-        try:
-            last_active_dt = datetime.strptime(last_active, '%Y-%m-%d %H:%M:%S')
-            time_diff = datetime.now() - last_active_dt
-            if time_diff.days > 0:
-                last_seen = f"{time_diff.days}d ago"
-            elif time_diff.seconds // 3600 > 0:
-                last_seen = f"{time_diff.seconds // 3600}h ago"
-            elif time_diff.seconds // 60 > 0:
-                last_seen = f"{time_diff.seconds // 60}m ago"
-            else:
-                last_seen = "Just now"
-        except:
-            last_seen = "Unknown"
-        
-        user_list += f"{i}. {name_display} ({username_display})\n"
-        user_list += f"   🆔: {user_id} | 📨: {msg_count} | ⏰: {last_seen}\n\n"
-    
-    text = f"""
-📥 <b>Inbox Manager</b>
-
-Total Users: {total}
-Page: {page}/{total_pages}
-
-{user_list}
-    """
-    
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    
-    for i, user in enumerate(users[:5], start=1):
-        user_id, username, first_name, _, _ = user
-        name_display = first_name or f"User {user_id}"
-        if len(name_display) > 15:
-            name_display = name_display[:12] + "..."
-        keyboard.add(InlineKeyboardButton(f"👤 {name_display}", callback_data=f"manage_user_{user_id}"))
-    
-    pagination_keyboard = create_pagination_keyboard(page, total_pages, "inbox_manager", 
-                                                    [InlineKeyboardButton("⬅️ Back", callback_data="back_to_admin")])
-    
-    for row in pagination_keyboard.keyboard:
-        keyboard.add(*row)
-    
-    update_admin_panel_message(call.message.chat.id, call.message.message_id, text, keyboard)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('manage_user_'))
-def manage_user(call):
-    """Show user management options"""
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "❌ Unauthorized!", show_alert=True)
-        return
-    
-    user_id = int(call.data.split('_')[2])
-    user_info = get_user(user_id)
-    
-    if not user_info:
-        bot.answer_callback_query(call.id, "User not found!", show_alert=True)
-        return
-    
-    _, username, first_name, last_name, is_banned_user, created_at, msg_count, last_active = user_info
-    
-    username_display = f"@{username}" if username else "No Username"
-    name_display = f"{first_name or ''} {last_name or ''}".strip() or "Unknown"
-    created_date = created_at.split()[0] if created_at else "Unknown"
-    
-    has_active_session = user_id in active_sessions
-    session_info = ""
-    if has_active_session:
-        session = active_sessions[user_id]
-        session_info = f"\n💬 <b>Active Session:</b> {'⏸️ Paused' if session['is_paused'] else '▶️ Active'}"
-    
-    text = f"""
-👤 <b>User Management</b>
-
-📛 <b>Name:</b> {name_display}
-🔗 <b>Username:</b> {username_display}
-🆔 <b>ID:</b> <code>{user_id}</code>
-📅 <b>Joined:</b> {created_date}
-📨 <b>Messages:</b> {msg_count}
-🚫 <b>Status:</b> {'Banned' if is_banned_user else 'Active'}
-{session_info}
-
-<b>Select an action:</b>
-    """
-    
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    
-    if has_active_session:
-        if active_sessions[user_id]['admin_id'] == call.from_user.id or is_super_admin(call.from_user.id):
-            keyboard.add(InlineKeyboardButton("💬 In Session", callback_data=f"view_session_{user_id}"))
-        else:
-            keyboard.add(InlineKeyboardButton("💬 In Session (Other Admin)", callback_data="no_action"))
-    else:
-        keyboard.add(InlineKeyboardButton("💬 Start Chat", callback_data=f"admin_chat_{user_id}"))
-    
-    if is_banned_user:
-        keyboard.add(InlineKeyboardButton("🔓 Unban User", callback_data=f"unban_{user_id}"))
-    else:
-        keyboard.add(InlineKeyboardButton("🚫 Ban User", callback_data=f"ban_{user_id}"))
-    
-    keyboard.add(InlineKeyboardButton("⬅️ Back to Inbox", callback_data="inbox_manager_1"))
-    
-    update_admin_panel_message(call.message.chat.id, call.message.message_id, text, keyboard)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('admin_chat_'))
-def admin_start_chat(call):
-    """Admin manually starts chat with user"""
-    admin_id = call.from_user.id
-    user_id = int(call.data.split('_')[2])
-    
-    if user_id in active_sessions:
-        bot.answer_callback_query(call.id, "User already has an active session!", show_alert=True)
-        return
-    
-    session_id = add_session(user_id, admin_id)
-    active_sessions[user_id] = {
-        'admin_id': admin_id,
-        'session_id': session_id,
-        'start_time': datetime.now(),
-        'is_paused': False
-    }
-    
-    try:
-        keyboard = InlineKeyboardMarkup()
-        keyboard.row(
-            InlineKeyboardButton("⏸️ Pause", callback_data=f"pause_session_{session_id}"),
-            InlineKeyboardButton("⏹️ End", callback_data=f"end_session_{session_id}")
-        )
-        bot.send_message(user_id, "👋 An admin has started a chat with you. You can now message them directly.", reply_markup=keyboard)
-    except:
-        pass
-    
-    keyboard = InlineKeyboardMarkup()
-    keyboard.row(
-        InlineKeyboardButton("⏸️ Pause", callback_data=f"pause_session_{session_id}"),
-        InlineKeyboardButton("▶️ Resume", callback_data=f"resume_session_{session_id}")
-    )
-    keyboard.add(InlineKeyboardButton("⏹️ End Session", callback_data=f"end_session_{session_id}"))
-    keyboard.add(InlineKeyboardButton("⬅️ Back to User", callback_data=f"manage_user_{user_id}"))
-    
-    text = f"""
-💬 <b>Chat Session Started</b>
-
-You are now chatting with:
-👤 User ID: {user_id}
-📛 Name: {get_user(user_id)[2] or 'Unknown'}
-
-Use buttons below to manage the session.
-    """
-    
-    update_admin_panel_message(call.message.chat.id, call.message.message_id, text, keyboard)
-    bot.answer_callback_query(call.id, "✅ Chat session started!")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('ban_'))
-def ban_user_handler(call):
-    """Ban a user"""
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "❌ Unauthorized!", show_alert=True)
-        return
-    
-    user_id = int(call.data.split('_')[1])
-    ban_user(user_id)
-    
-    if user_id in active_sessions:
-        session_data = active_sessions.pop(user_id)
-        end_session(session_data['session_id'])
-    
-    bot.answer_callback_query(call.id, "✅ User banned!")
-    manage_user(call)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('unban_'))
-def unban_user_handler(call):
-    """Unban a user"""
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "❌ Unauthorized!", show_alert=True)
-        return
-    
-    user_id = int(call.data.split('_')[1])
-    unban_user(user_id)
-    bot.answer_callback_query(call.id, "✅ User unbanned!")
-    manage_user(call)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('group_manager_'))
-def show_group_manager(call):
-    """Show group manager with pagination"""
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "❌ Unauthorized!", show_alert=True)
-        return
-    
-    page = int(call.data.split('_')[2]) if len(call.data.split('_')) > 2 else 1
-    groups, total = get_all_groups(page-1, 8)
-    
-    if not groups:
-        text = "📂 <b>Group Manager</b>\n\nBot is not in any groups yet."
-        keyboard = InlineKeyboardMarkup()
-        keyboard.add(InlineKeyboardButton("⬅️ Back", callback_data="back_to_admin"))
-        update_admin_panel_message(call.message.chat.id, call.message.message_id, text, keyboard)
-        return
-    
-    total_pages = (total + 7) // 8
-    
-    group_list = ""
-    for i, group in enumerate(groups, start=1):
-        group_id, title, maintenance, link_filter, bot_active = group
-        status_icon = "🟢" if bot_active else "🔴"
-        mm_icon = "🔧" if maintenance else "⚙️"
-        lf_icon = "🔗" if link_filter else "➖"
-        
-        display_title = title[:25] + "..." if len(title) > 25 else title
-        
-        group_list += f"{i}. {status_icon} {display_title}\n"
-        group_list += f"   {mm_icon} {lf_icon} | ID: {group_id}\n\n"
-    
-    text = f"""
-📂 <b>Group Manager</b>
-
-Total Groups: {total}
-Page: {page}/{total_pages}
-
-{group_list}
-    """
-    
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    
-    for i, group in enumerate(groups[:4], start=1):
-        group_id, title, _, _, _ = group
-        display_title = title[:15] + "..." if len(title) > 15 else title
-        keyboard.add(InlineKeyboardButton(f"📊 {display_title}", callback_data=f"manage_group_{group_id}"))
-    
-    pagination_keyboard = create_pagination_keyboard(page, total_pages, "group_manager",
-                                                    [InlineKeyboardButton("⬅️ Back", callback_data="back_to_admin")])
-    
-    for row in pagination_keyboard.keyboard:
-        keyboard.add(*row)
-    
-    update_admin_panel_message(call.message.chat.id, call.message.message_id, text, keyboard)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('manage_group_'))
-def manage_group(call):
-    """Show group management options"""
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "❌ Unauthorized!", show_alert=True)
-        return
-    
-    group_id = int(call.data.split('_')[2])
-    admin_id = call.from_user.id
-    
-    group_info = get_group(group_id)
-    if not group_info:
-        bot.answer_callback_query(call.id, "Group not found!", show_alert=True)
-        return
-    
-    _, title, maintenance_mode, link_filter, bot_active, added_at = group_info
-    
-    text = f"""
-📂 <b>Group Management</b>
-
-🏷️ <b>Title:</b> {title}
-🆔 <b>ID:</b> <code>{group_id}</code>
-📅 <b>Added:</b> {added_at.split()[0] if added_at else 'Unknown'}
-
-<b>Current Settings:</b>
-🔧 Maintenance: {'ON ✅' if maintenance_mode else 'OFF ❌'}
-🔗 Link Filter: {'ON ✅' if link_filter else 'OFF ❌'}
-🤖 Bot Status: {'ACTIVE 🟢' if bot_active else 'PAUSED 🔴'}
-
-<b>Select action:</b>
-    """
-    
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    
-    keyboard.add(
-        InlineKeyboardButton(f"🔧 {'Disable' if maintenance_mode else 'Enable'} Maintenance", 
-                           callback_data=f"toggle_mm_{group_id}"),
-        InlineKeyboardButton(f"🔗 {'Disable' if link_filter else 'Enable'} Link Filter", 
-                           callback_data=f"toggle_lf_{group_id}")
-    )
-    
-    keyboard.add(
-        InlineKeyboardButton(f"🤖 {'Pause' if bot_active else 'Activate'} Bot", 
-                           callback_data=f"toggle_bs_{group_id}"),
-        InlineKeyboardButton("📢 Broadcast", callback_data=f"group_broadcast_{group_id}")
-    )
-    
-    if is_super_admin(admin_id):
-        keyboard.add(InlineKeyboardButton("🚪 Leave Group", callback_data=f"leave_group_{group_id}"))
-    
-    keyboard.add(InlineKeyboardButton("⬅️ Back to Groups", callback_data="group_manager_1"))
-    
-    update_admin_panel_message(call.message.chat.id, call.message.message_id, text, keyboard)
-
-@bot.callback_query_handler(func=lambda call: call.data == 'add_admin_menu')
-def add_admin_menu(call):
-    """Show add admin menu"""
-    if not is_super_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "❌ Only Super Admin can add admins!", show_alert=True)
-        return
-    
-    text = """
-👥 <b>Add New Admin</b>
-
-Send the user ID of the person you want to make admin:
-    """
-    
-    user_message_states[call.from_user.id] = {
-        'state': 'awaiting_admin_id',
-        'message_id': call.message.message_id
-    }
-    
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("❌ Cancel", callback_data="back_to_admin"))
-    
-    update_admin_panel_message(call.message.chat.id, call.message.message_id, text, keyboard)
-
-@bot.callback_query_handler(func=lambda call: call.data == 'set_leave_msg')
-def set_leave_message(call):
-    """Prompt admin to set leave message"""
-    if not is_super_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "❌ Only Super Admin can change settings!", show_alert=True)
-        return
-    
-    current_msg = get_setting('leave_message') or "👋 Goodbye!"
-    
-    text = f"""
-✍️ <b>Set Leave Message</b>
-
-Current message: {current_msg}
-
-Please send the new leave message:
-    """
-    
-    user_message_states[call.from_user.id] = {
-        'state': 'awaiting_leave_message',
-        'message_id': call.message.message_id
-    }
-    
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("❌ Cancel", callback_data="settings_menu"))
-    
-    update_admin_panel_message(call.message.chat.id, call.message.message_id, text, keyboard)
-
-@bot.callback_query_handler(func=lambda call: call.data == 'settings_menu')
-def settings_menu(call):
-    """Show settings menu"""
-    if not is_super_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "❌ Only Super Admin can access settings!", show_alert=True)
-        return
-    
-    leave_message = get_setting('leave_message') or "👋 Goodbye!"
-    
-    text = f"""
-⚙️ <b>Bot Settings</b>
-
-Current Settings:
-✍️ Leave Message: {leave_message[:50]}{'...' if len(leave_message) > 50 else ''}
-
-Select setting to modify:
-    """
-    
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("✍️ Change Leave Message", callback_data="set_leave_msg"),
-        InlineKeyboardButton("⬅️ Back", callback_data="back_to_admin")
-    )
-    
-    update_admin_panel_message(call.message.chat.id, call.message.message_id, text, keyboard)
-
-@bot.callback_query_handler(func=lambda call: call.data == 'back_to_admin')
-def back_to_admin_panel(call):
-    """Go back to admin panel"""
-    handle_admin_panel(call.message)
-
-@bot.callback_query_handler(func=lambda call: call.data == 'no_action')
-def no_action(call):
-    """Handle no action button"""
-    bot.answer_callback_query(call.id)
-
-# ================ MESSAGE HANDLERS ================
-
-@bot.message_handler(func=lambda message: True, content_types=['text', 'photo', 'video', 'document'])
-def handle_all_messages(message):
-    """Handle all incoming messages"""
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    
-    if message.chat.type in ['group', 'supergroup']:
-        handle_group_message(message)
-        return
-    
-    if message.chat.type == 'private':
-        handle_private_message(message)
-
-def handle_group_message(message):
-    """Handle messages in groups"""
-    group_id = message.chat.id
-    user_id = message.from_user.id
-    
-    if message.chat.type in ['group', 'supergroup']:
-        add_group(group_id, message.chat.title)
-    
-    settings = get_group_settings(group_id)
-    if not settings:
-        return
-    
-    maintenance_mode, link_filter, bot_active = settings
-    
-    if not bot_active:
-        return
-    
-    if maintenance_mode and not is_admin(user_id):
-        try:
-            bot.delete_message(group_id, message.message_id)
-        except:
-            pass
-        return
-    
-    if link_filter and not is_admin(user_id):
-        text = message.text or message.caption or ""
-        if text and ('http://' in text.lower() or 'https://' in text.lower() or 't.me/' in text.lower()):
-            try:
-                bot.delete_message(group_id, message.message_id)
-                
-                username = message.from_user.username
-                if username:
-                    mention = f"@{username}"
-                else:
-                    mention = message.from_user.first_name
-                
-                reply_text = f"{mention} হ্যাঁ ভাই🙂, উরাধুরা লিংক দাও, জায়গাটা কি তোমার বাপ কিনা রাখছে? 😒"
-                bot.send_message(group_id, reply_text)
-                    
-            except Exception as e:
-                logger.error(f"Error handling link filter: {e}")
-            return
-
-def handle_private_message(message):
-    """Handle private messages"""
-    user_id = message.from_user.id
-    
-    if user_id in user_message_states:
-        state = user_message_states[user_id]
-        
-        if state['state'] == 'awaiting_admin_id':
-            handle_admin_id_input(message, state)
-            return
-        
-        elif state['state'] == 'awaiting_leave_message':
-            handle_leave_message_input(message, state)
-            return
-    
-    if is_banned(user_id):
-        bot.send_message(user_id, "❌ You are banned from using this bot.")
-        return
-    
-    add_user(user_id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
-    
-    if user_id in active_sessions:
-        session = active_sessions[user_id]
-        
-        if session['is_paused']:
-            bot.send_message(user_id, "⏸️ Chat session is currently paused by admin. Your message was not sent.")
-            return
-        
-        admin_id = session['admin_id']
-        
-        try:
-            if message.content_type == 'text':
-                bot.send_message(admin_id, f"👤 User ({user_id}): {message.text}")
-            elif message.content_type == 'photo':
-                bot.send_photo(admin_id, message.photo[-1].file_id, caption=f"👤 User ({user_id}): {message.caption}")
-            elif message.content_type == 'video':
-                bot.send_video(admin_id, message.video.file_id, caption=f"👤 User ({user_id}): {message.caption}")
-            elif message.content_type == 'document':
-                bot.send_document(admin_id, message.document.file_id, caption=f"👤 User ({user_id}): {message.caption}")
-        except Exception as e:
-            bot.send_message(user_id, "❌ Failed to send message to admin.")
-            logger.error(f"Failed to forward message: {e}")
-    
-    elif is_admin(user_id):
-        for uid, session in list(active_sessions.items()):
-            if session['admin_id'] == user_id and not session['is_paused']:
-                try:
-                    if message.content_type == 'text':
-                        bot.send_message(uid, f"👮 Admin: {message.text}")
-                    elif message.content_type == 'photo':
-                        bot.send_photo(uid, message.photo[-1].file_id, caption=f"👮 Admin: {message.caption}")
-                    elif message.content_type == 'video':
-                        bot.send_video(uid, message.video.file_id, caption=f"👮 Admin: {message.caption}")
-                    elif message.content_type == 'document':
-                        bot.send_document(uid, message.document.file_id, caption=f"👮 Admin: {message.caption}")
-                except Exception as e:
-                    bot.send_message(user_id, f"❌ Failed to send message to user {uid}")
-                    logger.error(f"Failed to forward message to user: {e}")
-                return
-        
-        handle_admin_panel(message)
-
-def handle_admin_id_input(message, state):
-    """Handle admin ID input"""
-    try:
-        admin_id = int(message.text)
-        
-        try:
-            user_info = bot.get_chat(admin_id)
-            username = user_info.username or "No Username"
-            first_name = user_info.first_name or ""
-        except:
-            username = "Unknown"
-            first_name = "Unknown"
-        
-        add_admin(admin_id, username)
-        
-        success_text = f"""
-✅ <b>Admin Added Successfully</b>
-
-👤 New Admin: {first_name} (@{username})
-🆔 ID: {admin_id}
-        """
-        
-        keyboard = InlineKeyboardMarkup()
-        keyboard.add(InlineKeyboardButton("👥 Back to Admin Panel", callback_data="back_to_admin"))
-        
-        update_admin_panel_message(message.chat.id, state['message_id'], success_text, keyboard)
-        
-        try:
-            bot.send_message(admin_id, f"""
-🎉 <b>You have been added as an admin!</b>
-
-You can now access the admin panel using /admin
-            """, parse_mode='HTML')
-        except:
-            pass
-        
-        del user_message_states[message.from_user.id]
-        
-    except ValueError:
-        bot.send_message(message.chat.id, "❌ Invalid user ID. Please send a numeric ID.")
-
-def handle_leave_message_input(message, state):
-    """Handle leave message input"""
-    new_message = message.text
-    update_setting('leave_message', new_message)
-    
-    success_text = f"""
-✅ <b>Leave Message Updated</b>
-
-New message:
-{new_message}
-    """
-    
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("⬅️ Back to Settings", callback_data="settings_menu"))
-    
-    update_admin_panel_message(message.chat.id, state['message_id'], success_text, keyboard)
-    
-    del user_message_states[message.from_user.id]
-
-# ================ FLASK ROUTES FOR RENDER.COM ================
+# ================= FLASK SERVER =================
+app = Flask('')
 
 @app.route('/')
 def home():
-    return "🤖 Telegram Bot is running on Render!"
+    return "Bot is running perfectly!"
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """Webhook endpoint for Telegram"""
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return ''
-    else:
-        return 'Bad request', 400
+def run_web_server():
+    app.run(host='0.0.0.0', port=10000)
 
-@app.route('/set_webhook', methods=['GET'])
-def set_webhook():
-    """Set webhook for Telegram bot"""
-    webhook_url = f"https://{request.host}/webhook"
-    
+# ================= CONFIGURATION =================
+TOKEN = "8000160699:AAHq1VLvd05PFxFVibuErFx4E6Uf7y6F8HE"
+SUPER_ADMIN = 7832264582 
+bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=25)
+
+try:
+    bot.remove_webhook()
+except:
+    pass
+
+# ================= DATABASE SYSTEM =================
+db_lock = threading.Lock()
+
+def get_db_connection():
+    return sqlite3.connect('bot_final.db', check_same_thread=False)
+
+def init_db():
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY, access_level INTEGER DEFAULT 1)')
+        cursor.execute('CREATE TABLE IF NOT EXISTS groups (chat_id INTEGER PRIMARY KEY, title TEXT, assigned_admin INTEGER)')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS settings 
+                          (chat_id INTEGER PRIMARY KEY, maintenance INTEGER DEFAULT 0, 
+                           link_filter INTEGER DEFAULT 1, bot_status INTEGER DEFAULT 1,
+                           welcome_msg TEXT DEFAULT "Welcome to the group!")''')
+        cursor.execute('CREATE TABLE IF NOT EXISTS logs (date TEXT PRIMARY KEY, count INTEGER DEFAULT 0)')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS chat_requests 
+                          (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+                           status TEXT DEFAULT "pending", admin_id INTEGER, 
+                           request_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS active_chats 
+                          (user_id INTEGER PRIMARY KEY, admin_id INTEGER,
+                           start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        cursor.execute('CREATE TABLE IF NOT EXISTS banned_users (user_id INTEGER PRIMARY KEY, reason TEXT)')
+        conn.commit()
+        conn.close()
+
+init_db()
+
+def get_setting(chat_id, key):
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(f'SELECT {key} FROM settings WHERE chat_id = ?', (chat_id,))
+        res = cursor.fetchone()
+        conn.close()
+        if res: return res[0]
+        if key == 'welcome_msg': return "Welcome to the group!"
+        return 1 if key != 'maintenance' else 0
+
+def update_setting(chat_id, key, value):
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(f'INSERT OR IGNORE INTO settings (chat_id) VALUES (?)', (chat_id,))
+        cursor.execute(f'UPDATE settings SET {key} = ? WHERE chat_id = ?', (value, chat_id))
+        conn.commit()
+        conn.close()
+
+def toggle_setting(chat_id, key):
+    current = get_setting(chat_id, key)
+    new_val = 1 if current == 0 else 0
+    update_setting(chat_id, key, new_val)
+    return new_val
+
+def log_message():
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('INSERT OR IGNORE INTO logs VALUES (?, 0)', (today,))
+        cursor.execute('UPDATE logs SET count = count + 1 WHERE date = ?', (today,))
+        conn.commit()
+        conn.close()
+
+def is_admin(user_id, chat_id=None):
+    if user_id == SUPER_ADMIN: return 3  # Super Admin level
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT access_level FROM admins WHERE user_id = ?', (user_id,))
+        res = cursor.fetchone()
+        if not res: return 0
+        
+        # Check group assignment if chat_id provided
+        if chat_id:
+            cursor.execute('SELECT assigned_admin FROM groups WHERE chat_id = ?', (chat_id,))
+            group_admin = cursor.fetchone()
+            if group_admin and group_admin[0] and group_admin[0] != user_id:
+                return 0  # Not assigned to this group
+        
+        conn.close()
+        return res[0]
+
+def get_assigned_groups(admin_id):
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT chat_id, title FROM groups WHERE assigned_admin = ?', (admin_id,))
+        groups = cursor.fetchall()
+        conn.close()
+    return groups
+
+def generate_log_graph():
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM logs ORDER BY date DESC LIMIT 7')
+        data = cursor.fetchall()[::-1]
+        conn.close()
+    if not data: return None
+    labels = [row[0][-5:] for row in data]
+    values = [row[1] for row in data]
+    chart_config = {"type": "line", "data": {"labels": labels, "datasets": [{"label": "Activity", "data": values, "fill": True, "backgroundColor": "rgba(54, 162, 235, 0.2)", "borderColor": "rgb(54, 162, 235)", "tension": 0.4}]}}
+    config_str = json.dumps(chart_config)
+    chart_url = f"https://quickchart.io/chart?c={config_str}&width=800&height=400"
     try:
-        bot.remove_webhook()
-        time.sleep(1)
-        bot.set_webhook(url=webhook_url)
-        return f"✅ Webhook set successfully to: {webhook_url}"
-    except Exception as e:
-        return f"❌ Error setting webhook: {str(e)}"
+        response = requests.get(chart_url, timeout=10)
+        return io.BytesIO(response.content) if response.status_code == 200 else None
+    except: return None
 
-# ================ CLEANUP FUNCTIONS ================
+# ================= KEYBOARDS (ENGLISH) =================
+def main_admin_keyboard(admin_level=1):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    
+    buttons = [
+        types.InlineKeyboardButton("📊 Analytics Dashboard", callback_data="show_graph"),
+        types.InlineKeyboardButton("📂 Group Manager", callback_data="list_groups"),
+        types.InlineKeyboardButton("👥 Admin Management", callback_data="admin_menu"),
+        types.InlineKeyboardButton("🔄 System Settings", callback_data="system_settings"),
+        types.InlineKeyboardButton("📨 Chat Requests", callback_data="view_requests"),
+        types.InlineKeyboardButton("🚫 Banned Users", callback_data="banned_list")
+    ]
+    
+    markup.add(*buttons[:2])
+    markup.add(*buttons[2:4])
+    markup.add(*buttons[4:6])
+    
+    if admin_level >= 2:
+        markup.add(types.InlineKeyboardButton("⚙️ Advanced Controls", callback_data="advanced_menu"))
+    
+    return markup
 
-def cleanup_sessions():
-    """Clean up old sessions periodically"""
-    while True:
-        time.sleep(3600)
-        current_time = datetime.now()
+def system_settings_keyboard():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("📢 Global Broadcast", callback_data="bc_all"),
+        types.InlineKeyboardButton("📋 View All Groups", callback_data="view_all_groups"),
+        types.InlineKeyboardButton("🛠️ Maintenance Mode", callback_data="toggle_maintenance"),
+        types.InlineKeyboardButton("📊 Activity Logs", callback_data="activity_logs"),
+        types.InlineKeyboardButton("⬅️ Back", callback_data="back_main")
+    )
+    return markup
+
+def admin_management_keyboard():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("➕ Add Admin", callback_data="add_admin"),
+        types.InlineKeyboardButton("➖ Remove Admin", callback_data="del_admin_list"),
+        types.InlineKeyboardButton("📋 Admin List", callback_data="admin_list"),
+        types.InlineKeyboardButton("🎚️ Set Admin Level", callback_data="set_admin_level"),
+        types.InlineKeyboardButton("📝 Assign Group", callback_data="assign_group"),
+        types.InlineKeyboardButton("⬅️ Back", callback_data="back_main")
+    )
+    return markup
+
+def group_control_keyboard(chat_id, admin_level):
+    m = get_setting(chat_id, 'maintenance')
+    l = get_setting(chat_id, 'link_filter')
+    s = get_setting(chat_id, 'bot_status')
+    
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton(f"{'🔴' if m else '🟢'} Maintenance", callback_data=f"tog_m_{chat_id}"),
+        types.InlineKeyboardButton(f"{'🟢' if l else '🔴'} Link Filter", callback_data=f"tog_l_{chat_id}"),
+        types.InlineKeyboardButton(f"{'✅' if s else '⏸'} Bot Status", callback_data=f"tog_s_{chat_id}"),
+        types.InlineKeyboardButton("📢 Broadcast", callback_data=f"bc_{chat_id}")
+    )
+    
+    if admin_level >= 2:
+        markup.add(
+            types.InlineKeyboardButton("✏️ Welcome Msg", callback_data=f"welcome_{chat_id}"),
+            types.InlineKeyboardButton("👥 Assign Admin", callback_data=f"assign_{chat_id}")
+        )
+    
+    markup.add(
+        types.InlineKeyboardButton("📊 Group Stats", callback_data=f"stats_{chat_id}"),
+        types.InlineKeyboardButton("⬅️ Back", callback_data="list_groups")
+    )
+    return markup
+
+def chat_request_keyboard(user_id):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("✅ Accept", callback_data=f"accept_{user_id}"),
+        types.InlineKeyboardButton("❌ Reject", callback_data=f"reject_{user_id}")
+    )
+    return markup
+
+def active_chat_keyboard(user_id):
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    markup.add(
+        types.InlineKeyboardButton("🚪 End Chat", callback_data=f"endchat_{user_id}"),
+        types.InlineKeyboardButton("⏸️ Pause", callback_data=f"pause_{user_id}"),
+        types.InlineKeyboardButton("🚫 Ban User", callback_data=f"ban_{user_id}")
+    )
+    return markup
+
+def start_keyboard():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(types.KeyboardButton("📞 Request Chat with Admin"))
+    markup.add(types.KeyboardButton("📋 Bot Commands"))
+    return markup
+
+# ================= HANDLERS =================
+@bot.message_handler(commands=['start'])
+def start_command(message):
+    uid = message.from_user.id
+    cid = message.chat.id
+    
+    if message.chat.type == "private":
+        bot.send_message(cid, "👋 Welcome! Use the buttons below:", reply_markup=start_keyboard())
         
-        for user_id, session_data in list(active_sessions.items()):
-            if (current_time - session_data['start_time']).total_seconds() > 86400:
-                end_session(session_data['session_id'])
-                active_sessions.pop(user_id, None)
+        # Log chat request
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT status FROM chat_requests WHERE user_id = ?', (uid,))
+            existing = cursor.fetchone()
+            
+            if not existing:
+                cursor.execute('''INSERT INTO chat_requests (user_id, username, first_name, status) 
+                                  VALUES (?, ?, ?, "pending")''',
+                              (uid, message.from_user.username, message.from_user.first_name))
+                conn.commit()
                 
+                # Notify super admin
+                bot.send_message(
+                    SUPER_ADMIN,
+                    f"📨 New Chat Request!\n\n"
+                    f"👤 User: {message.from_user.first_name}\n"
+                    f"🆔 ID: {uid}\n"
+                    f"📛 Username: @{message.from_user.username if message.from_user.username else 'N/A'}\n"
+                    f"🕐 Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    reply_markup=chat_request_keyboard(uid)
+                )
+            conn.close()
+
+@bot.message_handler(func=lambda m: True, content_types=['text', 'photo', 'video', 'document'])
+def handle_all(message):
+    uid = message.from_user.id
+    cid = message.chat.id
+    log_message()
+
+    # Handle private chat messages
+    if message.chat.type == "private":
+        # Check if user is in active chat with admin
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT admin_id FROM active_chats WHERE user_id = ?', (uid,))
+            active_chat = cursor.fetchone()
+            conn.close()
+        
+        if active_chat:
+            # Forward message to admin
+            try:
+                bot.send_message(
+                    active_chat[0],
+                    f"📩 From User {uid}:\n{message.text if message.text else '[Media Message]'}"
+                )
+            except:
+                pass
+            return
+        
+        # Handle "Request Chat with Admin" button
+        if message.text == "📞 Request Chat with Admin":
+            start_command(message)
+            return
+        
+        # Handle admin commands
+        if message.text == "/admin" and is_admin(uid):
+            admin_level = is_admin(uid)
+            bot.send_message(cid, "🔧 **Admin Control Panel**", 
+                           reply_markup=main_admin_keyboard(admin_level), 
+                           parse_mode="Markdown")
+            return
+    
+    # Group handling
+    if message.chat.type != "private":
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('INSERT OR REPLACE INTO groups VALUES (?, ?, ?)', 
+                         (cid, message.chat.title, None))
+            conn.commit()
+            conn.close()
+
+        # ১. বট স্ট্যাটাস চেক
+        if get_setting(cid, 'bot_status') == 0:
+            return
+
+        # ২. মেইনটেন্যান্স চেক
+        if get_setting(cid, 'maintenance') == 1 and not is_admin(uid, cid):
+            return
+
+        # ৩. লিংক ফিল্টার (বাংলায় সতর্কবার্তা)
+        if get_setting(cid, 'link_filter') == 1:
+            text = message.text or message.caption or ""
+            if any(link in text for link in ["http://", "https://", "t.me/", "www."]) and not is_admin(uid, cid):
                 try:
-                    bot.send_message(session_data['admin_id'], 
-                                   f"⏰ Session with User ID {user_id} automatically ended (24h limit).")
-                except:
-                    pass
-        
-        current_timestamp = time.time()
-        for user_id, timestamp in list(user_cooldowns.items()):
-            if current_timestamp - timestamp > 600:
-                user_cooldowns.pop(user_id, None)
+                    bot.delete_message(cid, message.message_id)
+                    warning_msg = f"🚫 {message.from_user.first_name}, লিংক শেয়ার করা নিষিদ্ধ! ❌\n\n"
+                    warning_msg += f"📛 User ID: `{uid}`\n"
+                    warning_msg += f"⏰ Time: {datetime.datetime.now().strftime('%H:%M:%S')}"
+                    
+                    bot.send_message(cid, warning_msg, parse_mode="Markdown")
+                except Exception as e:
+                    print(f"Error deleting message: {e}")
 
-# ================ MAIN FUNCTION ================
+@bot.callback_query_handler(func=lambda call: True)
+def callback_logic(call):
+    uid = call.from_user.id
+    cid = call.message.chat.id
+    mid = call.message.message_id
 
-if __name__ == '__main__':
-    # Initialize database
-    init_db()
-    
-    # Start cleanup thread
-    cleanup_thread = threading.Thread(target=cleanup_sessions, daemon=True)
-    cleanup_thread.start()
-    
-    # Get Render URL
-    render_url = os.environ.get('RENDER_EXTERNAL_URL', '')
-    
-    if render_url:
-        # On Render - use webhook
-        logger.info("Running on Render - using webhook mode")
-        webhook_url = f"{render_url}/webhook"
+    admin_level = is_admin(uid)
+    if admin_level == 0 and not call.data.startswith("accept_") and not call.data.startswith("reject_"):
+        bot.answer_callback_query(call.id, "⚠️ Access Denied!")
+        return
+
+    if call.data == "show_graph":
+        bot.answer_callback_query(call.id, "📈 Generating graph...")
+        graph = generate_log_graph()
+        if graph: 
+            bot.send_photo(cid, graph, caption="📊 **Activity Analytics (Last 7 Days)**", parse_mode="Markdown")
+        else:
+            bot.answer_callback_query(call.id, "❌ No data available!")
         
-        # Remove existing webhook and set new one
-        bot.remove_webhook()
-        time.sleep(1)
+    elif call.data == "list_groups":
+        groups = get_assigned_groups(uid) if admin_level < 3 else []
+        if admin_level < 3 and groups:
+            markup = types.InlineKeyboardMarkup()
+            for chat_id, title in groups:
+                markup.add(types.InlineKeyboardButton(f"📍 {title}", callback_data=f"mng_{chat_id}"))
+        else:
+            with db_lock:
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                cursor.execute('SELECT chat_id, title FROM groups')
+                rows = cursor.fetchall()
+                conn.close()
+            
+            markup = types.InlineKeyboardMarkup()
+            for row in rows:
+                markup.add(types.InlineKeyboardButton(f"📍 {row[1]}", callback_data=f"mng_{row[0]}"))
         
+        markup.add(types.InlineKeyboardButton("➕ Add New Group", callback_data="add_group"))
+        markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data="back_main"))
+        
+        bot.edit_message_text("🏢 **Select a group to manage:**", cid, mid, 
+                             reply_markup=markup, parse_mode="Markdown")
+
+    elif call.data.startswith("mng_"):
+        target_id = int(call.data.split("_")[1])
+        bot.edit_message_text(f"⚙️ **Group Control Panel**\n\n📌 Group ID: `{target_id}`", 
+                             cid, mid, parse_mode="Markdown", 
+                             reply_markup=group_control_keyboard(target_id, admin_level))
+
+    elif call.data.startswith("tog_"):
+        _, key_code, target_id = call.data.split("_")
+        key_map = {'m': 'maintenance', 'l': 'link_filter', 's': 'bot_status'}
+        new_val = toggle_setting(int(target_id), key_map[key_code])
+        status_text = "ON ✅" if new_val == 1 else "OFF ❌"
+        bot.answer_callback_query(call.id, f"Status changed to {status_text}")
+        bot.edit_message_reply_markup(cid, mid, 
+                                     reply_markup=group_control_keyboard(int(target_id), admin_level))
+
+    elif call.data == "admin_menu":
+        bot.edit_message_text("👥 **Admin Management Panel**", cid, mid,
+                             reply_markup=admin_management_keyboard(), parse_mode="Markdown")
+
+    elif call.data == "add_admin":
+        if uid != SUPER_ADMIN:
+            bot.answer_callback_query(call.id, "❌ Super Admin only!")
+            return
+        msg = bot.send_message(cid, "🆔 Send the **User ID** of the new admin:")
+        bot.register_next_step_handler(msg, process_add_admin)
+
+    elif call.data == "del_admin_list":
+        if uid != SUPER_ADMIN: 
+            bot.answer_callback_query(call.id, "❌ Super Admin only!")
+            return
+        
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT user_id FROM admins WHERE user_id != ?', (SUPER_ADMIN,))
+            admins = cursor.fetchall()
+            conn.close()
+        
+        if not admins:
+            bot.answer_callback_query(call.id, "📭 No other admins found!")
+            return
+        
+        markup = types.InlineKeyboardMarkup()
+        for a in admins:
+            markup.add(types.InlineKeyboardButton(f"❌ Remove Admin {a[0]}", 
+                                                callback_data=f"rem_{a[0]}"))
+        markup.add(types.InlineKeyboardButton("⬅️ Back", callback_data="admin_menu"))
+        bot.edit_message_text("🗑️ **Select admin to remove:**", cid, mid, 
+                             reply_markup=markup, parse_mode="Markdown")
+
+    elif call.data.startswith("rem_"):
+        if uid != SUPER_ADMIN:
+            bot.answer_callback_query(call.id, "❌ Super Admin only!")
+            return
+        
+        target_uid = int(call.data.split("_")[1])
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM admins WHERE user_id = ?', (target_uid,))
+            conn.commit()
+            conn.close()
+        
+        bot.answer_callback_query(call.id, "✅ Admin removed successfully!")
+        callback_logic(call)
+
+    elif call.data == "admin_list":
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT user_id, access_level FROM admins')
+            admins = cursor.fetchall()
+            conn.close()
+        
+        text = "👑 **Administrators List:**\n\n"
+        text += f"• 👑 Super Admin: `{SUPER_ADMIN}` (Level 3)\n"
+        
+        for a in admins:
+            level_text = "Full" if a[1] == 2 else "Basic"
+            text += f"• 👤 Admin `{a[0]}`: {level_text} Access (Level {a[1]})\n"
+        
+        bot.send_message(cid, text, parse_mode="Markdown")
+
+    elif call.data == "view_requests":
+        if uid != SUPER_ADMIN:
+            bot.answer_callback_query(call.id, "❌ Super Admin only!")
+            return
+        
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('''SELECT user_id, username, first_name, request_time 
+                              FROM chat_requests 
+                              WHERE status = "pending" 
+                              ORDER BY request_time DESC''')
+            requests = cursor.fetchall()
+            conn.close()
+        
+        if not requests:
+            bot.send_message(cid, "📭 No pending chat requests.")
+            return
+        
+        text = "📨 **Pending Chat Requests:**\n\n"
+        for req in requests:
+            text += f"👤 {req[2]} (@{req[1] if req[1] else 'N/A'})\n"
+            text += f"🆔 ID: `{req[0]}`\n"
+            text += f"🕐 Requested: {req[3]}\n"
+            text += "─" * 20 + "\n"
+        
+        bot.send_message(cid, text, parse_mode="Markdown")
+
+    elif call.data.startswith("accept_"):
+        if uid != SUPER_ADMIN:
+            bot.answer_callback_query(call.id, "❌ Super Admin only!")
+            return
+        
+        user_id = int(call.data.split("_")[1])
+        
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # Get user info
+            cursor.execute('SELECT first_name FROM chat_requests WHERE user_id = ?', (user_id,))
+            user_info = cursor.fetchone()
+            
+            # Update status
+            cursor.execute('UPDATE chat_requests SET status = "accepted", admin_id = ? WHERE user_id = ?', 
+                         (uid, user_id))
+            
+            # Create active chat
+            cursor.execute('INSERT OR REPLACE INTO active_chats (user_id, admin_id) VALUES (?, ?)', 
+                         (user_id, uid))
+            
+            conn.commit()
+            conn.close()
+        
+        # Notify user
         try:
-            bot.set_webhook(url=webhook_url)
-            logger.info(f"Webhook set to: {webhook_url}")
+            bot.send_message(user_id, "✅ **Your chat request has been accepted!**\n\n"
+                                    "You can now chat directly with the admin. Type your message below.")
+        except:
+            pass
+        
+        # Update admin message
+        bot.edit_message_text(f"✅ Chat request accepted!\n\n👤 User ID: `{user_id}`\n📛 Name: {user_info[0]}", 
+                             cid, mid, parse_mode="Markdown",
+                             reply_markup=active_chat_keyboard(user_id))
+        
+        bot.answer_callback_query(call.id, "✅ Chat session started!")
+
+    elif call.data.startswith("reject_"):
+        if uid != SUPER_ADMIN:
+            bot.answer_callback_query(call.id, "❌ Super Admin only!")
+            return
+        
+        user_id = int(call.data.split("_")[1])
+        
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('UPDATE chat_requests SET status = "rejected" WHERE user_id = ?', (user_id,))
+            conn.commit()
+            conn.close()
+        
+        # Notify user
+        try:
+            bot.send_message(user_id, "❌ Your chat request has been rejected by the admin.")
+        except:
+            pass
+        
+        bot.edit_message_text(f"❌ Chat request rejected!\n\nUser ID: `{user_id}`", 
+                             cid, mid, parse_mode="Markdown")
+        bot.answer_callback_query(call.id, "Request rejected!")
+
+    elif call.data.startswith("endchat_"):
+        user_id = int(call.data.split("_")[1])
+        
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM active_chats WHERE user_id = ?', (user_id,))
+            cursor.execute('UPDATE chat_requests SET status = "closed" WHERE user_id = ?', (user_id,))
+            conn.commit()
+            conn.close()
+        
+        # Notify user
+        try:
+            bot.send_message(user_id, "🔚 The chat session has been ended by the admin.")
+        except:
+            pass
+        
+        bot.edit_message_text(f"🔚 Chat session ended!\n\nUser ID: `{user_id}`", 
+                             cid, mid, parse_mode="Markdown")
+        bot.answer_callback_query(call.id, "Chat ended!")
+
+    elif call.data.startswith("ban_"):
+        user_id = int(call.data.split("_")[1])
+        
+        msg = bot.send_message(cid, f"🚫 Enter ban reason for user `{user_id}`:", parse_mode="Markdown")
+        bot.register_next_step_handler(msg, process_ban_user, user_id)
+
+    elif call.data == "system_settings":
+        bot.edit_message_text("⚙️ **System Settings Panel**", cid, mid,
+                             reply_markup=system_settings_keyboard(), parse_mode="Markdown")
+
+    elif call.data == "bc_all":
+        if admin_level < 2:
+            bot.answer_callback_query(call.id, "❌ Requires admin level 2+")
+            return
+        
+        msg = bot.send_message(cid, "📢 Send your **Global Broadcast Message**:")
+        bot.register_next_step_handler(msg, start_bc, "all")
+
+    elif call.data.startswith("bc_"):
+        target_id = call.data.split("_")[1]
+        msg = bot.send_message(cid, f"📢 Send broadcast message for group `{target_id}`:")
+        bot.register_next_step_handler(msg, start_bc, target_id)
+
+    elif call.data == "assign_group":
+        if uid != SUPER_ADMIN:
+            bot.answer_callback_query(call.id, "❌ Super Admin only!")
+            return
+        
+        msg = bot.send_message(cid, "📝 Send: `group_id admin_id`\nExample: `-100123456789 123456789`", 
+                             parse_mode="Markdown")
+        bot.register_next_step_handler(msg, process_assign_group)
+
+    elif call.data == "back_main":
+        admin_level = is_admin(uid)
+        bot.edit_message_text("🔧 **Admin Control Panel**", cid, mid, 
+                             reply_markup=main_admin_keyboard(admin_level), 
+                             parse_mode="Markdown")
+
+# ================= HELPER FUNCTIONS =================
+def process_add_admin(message):
+    try:
+        new_id = int(message.text)
+        if new_id == SUPER_ADMIN:
+            bot.send_message(message.chat.id, "❌ This user is already Super Admin!")
+            return
+        
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (new_id,))
+            conn.commit()
+            conn.close()
+        
+        bot.send_message(message.chat.id, f"✅ Admin added successfully!\nUser ID: `{new_id}`", 
+                        parse_mode="Markdown")
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Invalid User ID format!")
+
+def process_assign_group(message):
+    try:
+        parts = message.text.split()
+        if len(parts) != 2:
+            bot.send_message(message.chat.id, "❌ Invalid format! Use: `group_id admin_id`")
+            return
+        
+        group_id = int(parts[0])
+        admin_id = int(parts[1])
+        
+        with db_lock:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('UPDATE groups SET assigned_admin = ? WHERE chat_id = ?', 
+                         (admin_id, group_id))
+            conn.commit()
+            conn.close()
+        
+        bot.send_message(message.chat.id, f"✅ Group `{group_id}` assigned to admin `{admin_id}`", 
+                        parse_mode="Markdown")
+    except:
+        bot.send_message(message.chat.id, "❌ Invalid input!")
+
+def process_ban_user(message, user_id):
+    reason = message.text
+    
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('INSERT OR REPLACE INTO banned_users VALUES (?, ?)', (user_id, reason))
+        
+        # End active chat if exists
+        cursor.execute('DELETE FROM active_chats WHERE user_id = ?', (user_id,))
+        cursor.execute('UPDATE chat_requests SET status = "banned" WHERE user_id = ?', (user_id,))
+        
+        conn.commit()
+        conn.close()
+    
+    # Notify user
+    try:
+        bot.send_message(user_id, f"🚫 You have been banned!\nReason: {reason}")
+    except:
+        pass
+    
+    bot.send_message(message.chat.id, f"✅ User `{user_id}` banned!\nReason: {reason}", 
+                    parse_mode="Markdown")
+
+def start_bc(message, target):
+    with db_lock:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        if target == "all":
+            cursor.execute('SELECT chat_id FROM groups')
+            ids = [r[0] for r in cursor.fetchall()]
+            target_name = "All Groups"
+        else:
+            ids = [int(target)]
+            cursor.execute('SELECT title FROM groups WHERE chat_id = ?', (int(target),))
+            group_info = cursor.fetchone()
+            target_name = group_info[0] if group_info else f"Group {target}"
+        
+        conn.close()
+    
+    def send_task():
+        success = 0
+        failed = 0
+        
+        for tid in ids:
+            try:
+                if message.content_type == 'text':
+                    bot.send_message(tid, message.text)
+                elif message.content_type == 'photo':
+                    bot.send_photo(tid, message.photo[-1].file_id, caption=message.caption)
+                elif message.content_type == 'video':
+                    bot.send_video(tid, message.video.file_id, caption=message.caption)
+                elif message.content_type == 'document':
+                    bot.send_document(tid, message.document.file_id, caption=message.caption)
+                
+                success += 1
+                time.sleep(0.1)
+            except Exception as e:
+                failed += 1
+                print(f"Failed to send to {tid}: {e}")
+        
+        # Send report
+        report = f"📊 **Broadcast Report**\n\n"
+        report += f"✅ Success: {success}\n"
+        report += f"❌ Failed: {failed}\n"
+        report += f"🎯 Target: {target_name}\n"
+        report += f"📅 Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        
+        bot.send_message(message.chat.id, report, parse_mode="Markdown")
+    
+    threading.Thread(target=send_task).start()
+    bot.send_message(message.chat.id, "⏳ Broadcast started... You'll get a report when done.")
+
+# ================= RUN =================
+if __name__ == "__main__":
+    threading.Thread(target=run_web_server, daemon=True).start()
+    print("🤖 Bot is running with enhanced admin panel...")
+    print(f"👑 Super Admin ID: {SUPER_ADMIN}")
+    
+    while True:
+        try:
+            bot.polling(none_stop=True, interval=0, timeout=30)
         except Exception as e:
-            logger.error(f"Error setting webhook: {e}")
-        
-        # Run Flask app
-        port = int(os.environ.get('PORT', 8080))
-        app.run(host='0.0.0.0', port=port, debug=False)
-    else:
-        # Local development - use polling
-        logger.info("Running locally - using polling mode")
-        
-        # Remove webhook if exists
-        bot.remove_webhook()
-        time.sleep(1)
-        
-        # Start bot polling in a separate thread
-        bot_thread = threading.Thread(target=bot.polling, kwargs={'none_stop': True, 'interval': 0, 'timeout': 20}, daemon=True)
-        bot_thread.start()
-        
-        # Run Flask app for health check
-        app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
+            print(f"⚠️ Error: {e}")
+            time.sleep(5)
